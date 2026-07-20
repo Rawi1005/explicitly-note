@@ -127,6 +127,18 @@ final class DictionaryLookupViewModel {
         return "\(first.word): \(primary.definition)"
     }
 
+    /// Failures where showing an expired cached copy is better than an
+    /// error. `wordNotFound` and selection errors are excluded: the cache
+    /// can't fix a misspelled or unknown word.
+    private func isNetworkFailure(_ error: DictionaryError) -> Bool {
+        switch error {
+        case .noConnection, .network, .serverError, .invalidResponse, .decodingFailed:
+            true
+        case .emptySelection, .invalidSelection, .invalidURL, .wordNotFound:
+            false
+        }
+    }
+
     /// First non-empty definition across all entries and meanings,
     /// paired with the part of speech it belongs to.
     private func primaryDefinition(in entries: [DictionaryEntry]) -> (definition: String, partOfSpeech: String?)? {
