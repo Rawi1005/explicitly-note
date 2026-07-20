@@ -1,0 +1,27 @@
+name: ExplicitlyNote
+options:
+  bundleIdPrefix: com.explicitlynote
+  deploymentTarget:
+    iOS: "16.0"
+
+targets:
+  ExplicitlyNote:
+    type: application
+    platform: iOS
+    sources:
+      - path: ExplicitlyNote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.explicitlynote.app
+        TARGETED_DEVICE_FAMILY: "2"          # iPad only
+        SUPPORTS_MACCATALYST: NO
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndoorNavigation: NO
+        INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        DEVELOPMENT_ASSET_PATHS: "\"ExplicitlyNote/Preview Content\""
+        ENABLE_PREVIEWS: YES
+        SWIFT_VERSION: "5.0"
