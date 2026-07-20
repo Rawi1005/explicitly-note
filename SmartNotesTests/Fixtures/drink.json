@@ -1,0 +1,76 @@
+[
+  {
+    "word": "drink",
+    "phonetic": "/drɪŋk/",
+    "phonetics": [
+      {
+        "text": "/drɪŋk/",
+        "audio": "https://api.dictionaryapi.dev/media/pronunciations/en/drink-us.mp3"
+      },
+      {
+        "text": "/dɹɪŋk/"
+      }
+    ],
+    "meanings": [
+      {
+        "partOfSpeech": "noun",
+        "definitions": [
+          {
+            "definition": "A beverage; a liquid that is swallowed to quench thirst or for nourishment.",
+            "example": "Would you like a drink of water?",
+            "synonyms": ["beverage"],
+            "antonyms": []
+          },
+          {
+            "definition": "A serving of an alcoholic beverage.",
+            "example": "They went out for drinks after work.",
+            "synonyms": [],
+            "antonyms": []
+          },
+          {
+            "definition": "Alcoholic beverages in general; the habit of drinking alcohol.",
+            "synonyms": ["alcohol", "the bottle"],
+            "antonyms": []
+          }
+        ],
+        "synonyms": ["beverage", "refreshment"],
+        "antonyms": []
+      },
+      {
+        "partOfSpeech": "verb",
+        "definitions": [
+          {
+            "definition": "To consume (a liquid) through the mouth.",
+            "example": "He drank the glass of milk in one go."
+          },
+          {
+            "definition": "To consume alcoholic beverages, especially habitually."
+          }
+        ],
+        "synonyms": ["imbibe", "quaff"],
+        "antonyms": []
+      }
+    ],
+    "sourceUrls": [
+      "https://en.wiktionary.org/wiki/drink"
+    ]
+  },
+  {
+    "word": "drink",
+    "phonetics": [
+      {
+        "audio": ""
+      }
+    ],
+    "meanings": [
+      {
+        "partOfSpeech": "noun",
+        "definitions": [
+          {
+            "definition": "The sea or other large body of water, especially in the phrase \"in the drink\"."
+          }
+        ]
+      }
+    ]
+  }
+]
