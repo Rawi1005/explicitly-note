@@ -39,7 +39,7 @@ final class RichTextCommands {
             let shouldAdd = !(firstFont?.fontDescriptor.symbolicTraits.contains(trait) ?? false)
 
             storage.beginEditing()
-            storage.enumerateAttribute(.font, in: range) { value, subRange, _ in
+            storage.enumerateAttribute(.font, in: range, options: []) { value, subRange, _ in
                 let base = (value as? UIFont) ?? Self.bodyFont
                 var traits = base.fontDescriptor.symbolicTraits
                 if shouldAdd { traits.insert(trait) } else { traits.remove(trait) }
@@ -243,7 +243,10 @@ struct RichTextEditor: UIViewRepresentable {
 
         func textViewDidChange(_ textView: UITextView) {
             guard !isApplyingExternalChange else { return }
-            parent.attributedText = textView.attributedText
+            // Copy so the binding holds an immutable snapshot; handing out
+            // the text view's mutable backing store would let the value
+            // mutate in place and defeat SwiftUI's change detection.
+            parent.attributedText = NSAttributedString(attributedString: textView.attributedText)
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {

@@ -71,7 +71,7 @@ final class NoteEditorViewModel {
     private static func normalizingColors(of source: NSAttributedString) -> NSAttributedString {
         let result = NSMutableAttributedString(attributedString: source)
         let fullRange = NSRange(location: 0, length: result.length)
-        result.enumerateAttribute(.foregroundColor, in: fullRange) { value, range, _ in
+        result.enumerateAttribute(.foregroundColor, in: fullRange, options: []) { value, range, _ in
             var semantic = UIColor.label
             if let color = value as? UIColor {
                 var white: CGFloat = 0
