@@ -1,27 +1,38 @@
-name: ExplicitlyNote
+name: SmartNotes
 options:
-  bundleIdPrefix: com.explicitlynote
+  bundleIdPrefix: com.smartnotes
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "17.0"
 
 targets:
-  ExplicitlyNote:
+  SmartNotes:
     type: application
     platform: iOS
     sources:
-      - path: ExplicitlyNote
+      - path: SmartNotes
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.explicitlynote.app
-        TARGETED_DEVICE_FAMILY: "2"          # iPad only
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartnotes.app
+        TARGETED_DEVICE_FAMILY: "1,2"        # iPhone + iPad
         SUPPORTS_MACCATALYST: NO
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndoorNavigation: NO
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
-        DEVELOPMENT_ASSET_PATHS: "\"ExplicitlyNote/Preview Content\""
+        DEVELOPMENT_ASSET_PATHS: "\"SmartNotes/Preview Content\""
         ENABLE_PREVIEWS: YES
-        SWIFT_VERSION: "5.0"
+        SWIFT_VERSION: "5.9"
+
+  SmartNotesTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: SmartNotesTests
+    dependencies:
+      - target: SmartNotes
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
