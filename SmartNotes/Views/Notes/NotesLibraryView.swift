@@ -99,18 +99,14 @@ private struct NotesLibraryContent: View {
             .toolbar { libraryToolbar }
             .overlay { emptyState }
             .navigationTitle("Notes")
-            .confirmationDialog(
-                "Delete this note?",
-                isPresented: noteDeletionBinding,
-                titleVisibility: .visible
-            ) {
-                Button("Delete Note", role: .destructive) {
+            .alert("Delete this note?", isPresented: noteDeletionBinding) {
+                Button("Cancel", role: .cancel) {
+                    notePendingDeletion = nil
+                }
+                Button("Delete", role: .destructive) {
                     if let notePendingDeletion {
                         delete(notePendingDeletion)
                     }
-                    notePendingDeletion = nil
-                }
-                Button("Cancel", role: .cancel) {
                     notePendingDeletion = nil
                 }
             } message: {

@@ -19,6 +19,72 @@ struct PageElement: Codable, Identifiable, Equatable {
     var fontSize: Double
     var colorHex: String
     var imageFileName: String?
+    // Newer fields are optional so JSON saved by earlier versions still decodes.
+    /// Rotation in radians around the element's center.
+    var rotation: Double?
+    /// "left" | "center" | "right"
+    var alignment: String?
+    var isBold: Bool?
+    var isItalic: Bool?
+    /// "system" | "serif" | "rounded" | "mono"
+    var fontDesign: String?
+    /// Normalized crop rectangle (0...1 in image space); nil = uncropped.
+    var cropX: Double?
+    var cropY: Double?
+    var cropWidth: Double?
+    var cropHeight: Double?
+
+    var rotationAngle: Double {
+        get { rotation ?? 0 }
+        set { rotation = newValue }
+    }
+
+    var cropRect: CGRect? {
+        get {
+            guard let cropX, let cropY, let cropWidth, let cropHeight else { return nil }
+            return CGRect(x: cropX, y: cropY, width: cropWidth, height: cropHeight)
+        }
+        set {
+            cropX = newValue.map { Double($0.origin.x) }
+            cropY = newValue.map { Double($0.origin.y) }
+            cropWidth = newValue.map { Double($0.width) }
+            cropHeight = newValue.map { Double($0.height) }
+        }
+    }
+
+    var textAlignment: NSTextAlignment {
+        switch alignment {
+        case "center": .center
+        case "right": .right
+        default: .left
+        }
+    }
+
+    var font: UIFont {
+        var descriptor = UIFont.systemFont(ofSize: fontSize).fontDescriptor
+        switch fontDesign {
+        case "serif": descriptor = descriptor.withDesign(.serif) ?? descriptor
+        case "rounded": descriptor = descriptor.withDesign(.rounded) ?? descriptor
+        case "mono": descriptor = descriptor.withDesign(.monospaced) ?? descriptor
+        default: break
+        }
+        var traits: UIFontDescriptor.SymbolicTraits = []
+        if isBold == true { traits.insert(.traitBold) }
+        if isItalic == true { traits.insert(.traitItalic) }
+        if !traits.isEmpty, let withTraits = descriptor.withSymbolicTraits(traits) {
+            descriptor = withTraits
+        }
+        return UIFont(descriptor: descriptor, size: fontSize)
+    }
+
+    /// A copy with a fresh identity, offset slightly — used by Duplicate.
+    func duplicated() -> PageElement {
+        var copy = self
+        copy.id = UUID()
+        copy.x += 24
+        copy.y += 24
+        return copy
+    }
 
     var frame: CGRect {
         get { CGRect(x: x, y: y, width: width, height: height) }

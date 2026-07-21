@@ -141,21 +141,51 @@ final class DictionaryLookupViewModel {
 
     /// Saves the first entry's word with its first definition as the short
     /// definition. Duplicate-safe: the service returns the existing item.
-    func saveToVocabulary(entries: [DictionaryEntry], sourceNoteTitle: String?) {
+    func saveToVocabulary(
+        entries: [DictionaryEntry],
+        sourceNoteTitle: String?,
+        details: VocabularySaveDetails = VocabularySaveDetails()
+    ) {
         guard let vocabularyService, let first = entries.first else { return }
         let primary = primaryDefinition(in: entries)
+        var enriched = details
+        if enriched.phonetic == nil {
+            enriched.phonetic = first.displayPhonetic
+        }
+        if enriched.exampleSentence == nil {
+            enriched.exampleSentence = firstExample(in: entries)
+        }
         do {
             try vocabularyService.saveWord(
                 word: first.word,
                 shortDefinition: primary?.definition ?? "",
                 partOfSpeech: primary?.partOfSpeech,
-                sourceNoteTitle: sourceNoteTitle
+                sourceNoteTitle: sourceNoteTitle,
+                details: enriched
             )
             isSaved = true
         } catch {
             // A failed save just leaves the button in its unsaved state.
             isSaved = false
         }
+    }
+
+    /// Compact "word: definition" line used when storing a definition.
+    func shortDefinitionText(from entries: [DictionaryEntry]) -> String {
+        primaryDefinition(in: entries)?.definition ?? ""
+    }
+
+    private func firstExample(in entries: [DictionaryEntry]) -> String? {
+        for entry in entries {
+            for meaning in entry.meanings ?? [] {
+                for definition in meaning.definitions ?? [] {
+                    if let example = definition.example, !example.isEmpty {
+                        return example
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     // MARK: - Insert into note

@@ -5,11 +5,12 @@ import SwiftData
 struct SmartNotesApp: App {
     var body: some Scene {
         WindowGroup {
-            NotebookLibraryView()
+            MainTabView()
         }
         .modelContainer(for: [
             Notebook.self,
             NotebookPage.self,
+            NotebookFolder.self,
             Note.self,
             CachedDictionaryEntry.self,
             VocabularyItem.self

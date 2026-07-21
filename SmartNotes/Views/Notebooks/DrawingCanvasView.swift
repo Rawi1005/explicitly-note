@@ -48,11 +48,12 @@ enum NotebookDrawingTool: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Tools that draw ink on the PencilKit canvas.
+    /// Tools that draw ink on the PencilKit canvas. The lasso is custom (it
+    /// selects ink AND elements together), so it is not a canvas tool.
     var isCanvasTool: Bool {
         switch self {
-        case .pen, .pencil, .highlighter, .eraser, .lasso: true
-        case .hand, .text: false
+        case .pen, .pencil, .highlighter, .eraser: true
+        case .hand, .text, .lasso: false
         }
     }
 }
@@ -205,13 +206,17 @@ final class DrawingCanvasController: ObservableObject {
             if canvasActive {
                 canvas.tool = tool
             }
-            pageView.elementsView.isInteractionAllowed = !canvasActive
+            pageView.elementsView.isInteractionAllowed =
+                (selectedTool == .hand || selectedTool == .text)
         }
 
         // One finger draws (when allowed); two fingers always pan.
+        // The lasso claims single-finger drags for itself.
         host.panGestureRecognizer.minimumNumberOfTouches =
-            (canvasActive && fingerDrawingEnabled) ? 2 : 1
+            ((canvasActive && fingerDrawingEnabled) || selectedTool == .lasso) ? 2 : 1
         host.singleTapRecognizer?.isEnabled = (selectedTool == .hand || selectedTool == .text)
+        host.textSelectionRecognizer?.isEnabled = selectedTool == .hand
+        host.lassoRecognizer?.isEnabled = selectedTool == .lasso
     }
 
     // MARK: Pencil
@@ -294,58 +299,91 @@ final class DrawingCanvasController: ObservableObject {
 
 // MARK: - Touch observer (Pencil detection + draw-and-hold)
 
-/// Passive recognizer that watches raw touches to detect Apple Pencil input and
-/// "draw and hold still" gestures. Never recognizes, never blocks other gestures.
+/// Passive recognizer that watches raw touches to detect Apple Pencil input
+/// and "draw and hold still" gestures. Never recognizes, never blocks other
+/// gestures. The hold fires WHILE the touch is still down, so the drawn
+/// stroke can morph into a clean shape before the finger lifts.
 final class TouchObservingGestureRecognizer: UIGestureRecognizer {
     var onPencilTouch: (() -> Void)?
-    var onHoldAtStrokeEnd: (() -> Void)?
+    /// Fired mid-touch once the pointer has been still for the hold interval.
+    /// Points are in the recognizer view's coordinate space.
+    var onLiveHoldShape: ((_ points: [CGPoint]) -> Void)?
+    /// Whether draw-and-hold snapping should currently be armed.
+    var shapeSnapEligibility: ((_ isPencilTouch: Bool) -> Bool)?
 
     private var trackingSingleTouch = false
-    private var touchStartTime: TimeInterval = 0
-    private var lastMoveTime: TimeInterval = 0
+    private var isPencilTouch = false
+    private var trackedPoints: [CGPoint] = []
     private var lastLocation: CGPoint = .zero
+    private var holdTimer: Timer?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         if touches.contains(where: { $0.type == .pencil }) {
             onPencilTouch?()
         }
         guard let touch = touches.first, event.allTouches?.count == 1 else {
-            trackingSingleTouch = false
+            stopTracking()
             return
         }
         trackingSingleTouch = true
-        touchStartTime = touch.timestamp
-        lastMoveTime = touch.timestamp
+        isPencilTouch = touch.type == .pencil
         lastLocation = touch.location(in: view)
+        trackedPoints = [lastLocation]
+        scheduleHoldTimer()
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         guard trackingSingleTouch, let touch = touches.first else { return }
         let location = touch.location(in: view)
-        if hypot(location.x - lastLocation.x, location.y - lastLocation.y) > 2.5 {
-            lastMoveTime = touch.timestamp
-            lastLocation = location
+        let distance = hypot(location.x - lastLocation.x, location.y - lastLocation.y)
+        guard distance > 1.5 else { return }
+        lastLocation = location
+        if trackedPoints.count < 4000 {
+            trackedPoints.append(location)
+        }
+        if distance > 2.5 {
+            // Still moving: push the hold deadline back.
+            scheduleHoldTimer()
         }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
-        finishTracking(touches)
+        stopTracking()
         state = .failed
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
-        finishTracking(touches)
+        stopTracking()
         state = .failed
     }
 
-    private func finishTracking(_ touches: Set<UITouch>) {
-        guard trackingSingleTouch, let touch = touches.first else { return }
+    private func stopTracking() {
         trackingSingleTouch = false
-        let duration = touch.timestamp - touchStartTime
-        let stillFor = touch.timestamp - lastMoveTime
-        if duration > 0.65, stillFor > 0.4 {
-            onHoldAtStrokeEnd?()
-        }
+        trackedPoints = []
+        holdTimer?.invalidate()
+        holdTimer = nil
+    }
+
+    private func scheduleHoldTimer() {
+        holdTimer?.invalidate()
+        guard trackingSingleTouch, shapeSnapEligibility?(isPencilTouch) == true else { return }
+        holdTimer = Timer.scheduledTimer(
+            timeInterval: 0.55,
+            target: self,
+            selector: #selector(holdTimerFired),
+            userInfo: nil,
+            repeats: false
+        )
+    }
+
+    @objc private func holdTimerFired() {
+        guard trackingSingleTouch, trackedPoints.count >= 8 else { return }
+        let points = trackedPoints
+        // One snap per touch: stop watching until the next touch begins.
+        trackingSingleTouch = false
+        holdTimer?.invalidate()
+        holdTimer = nil
+        onLiveHoldShape?(points)
     }
 }
 
@@ -356,8 +394,11 @@ final class PageCanvasView: UIView {
     let pdfPage: PDFPage?
     let backgroundView = PDFPageBackgroundView()
     let searchHighlightView = SearchHighlightOverlayView()
+    let annotationView = AnnotationUnderlineView()
     let elementsView = PageElementsView()
     let canvasView = PKCanvasView()
+    let textSelectionView = TextSelectionOverlayView()
+    let lassoOverlayView = LassoOverlayView()
 
     init(pageID: UUID, size: CGSize, pdfPage: PDFPage?) {
         self.pageID = pageID
@@ -368,12 +409,13 @@ final class PageCanvasView: UIView {
         // also stops PencilKit from color-inverting ink in dark mode.
         overrideUserInterfaceStyle = .light
         layer.shadowColor = UIColor.black.cgColor
-        layer.shadowOpacity = 0.18
-        layer.shadowRadius = 6
-        layer.shadowOffset = CGSize(width: 0, height: 2)
+        layer.shadowOpacity = 0.10
+        layer.shadowRadius = 10
+        layer.shadowOffset = CGSize(width: 0, height: 3)
 
         backgroundView.pdfPage = pdfPage
         searchHighlightView.pageRef = pdfPage?.pageRef
+        annotationView.pageRef = pdfPage?.pageRef
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.isScrollEnabled = false
@@ -381,8 +423,11 @@ final class PageCanvasView: UIView {
 
         addSubview(backgroundView)
         addSubview(searchHighlightView)
+        addSubview(annotationView)
         addSubview(elementsView)
         addSubview(canvasView)
+        addSubview(textSelectionView)
+        addSubview(lassoOverlayView)
     }
 
     required init?(coder: NSCoder) {
@@ -393,9 +438,42 @@ final class PageCanvasView: UIView {
         super.layoutSubviews()
         backgroundView.frame = bounds
         searchHighlightView.frame = bounds
+        annotationView.frame = bounds
         elementsView.frame = bounds
         canvasView.frame = bounds
+        textSelectionView.frame = bounds
+        lassoOverlayView.frame = bounds
         layer.shadowPath = UIBezierPath(rect: bounds).cgPath
+    }
+
+    // MARK: Coordinate mapping (view space <-> PDF page space)
+
+    private var pageTransform: CGAffineTransform? {
+        guard let pageRef = pdfPage?.pageRef else { return nil }
+        return pageRef.getDrawingTransform(
+            .mediaBox,
+            rect: bounds,
+            rotate: 0,
+            preserveAspectRatio: true
+        )
+    }
+
+    func pdfPagePoint(forViewPoint point: CGPoint) -> CGPoint? {
+        guard let transform = pageTransform else { return nil }
+        let flipped = CGPoint(x: point.x, y: bounds.height - point.y)
+        return flipped.applying(transform.inverted())
+    }
+
+    func viewRect(forPDFRect pdfRect: CGRect) -> CGRect {
+        guard let transform = pageTransform else { return .zero }
+        let cornerA = pdfRect.origin.applying(transform)
+        let cornerB = CGPoint(x: pdfRect.maxX, y: pdfRect.maxY).applying(transform)
+        return CGRect(
+            x: min(cornerA.x, cornerB.x),
+            y: bounds.height - max(cornerA.y, cornerB.y),
+            width: abs(cornerB.x - cornerA.x),
+            height: abs(cornerB.y - cornerA.y)
+        )
     }
 }
 
@@ -486,6 +564,8 @@ final class MultiPageScrollView: UIScrollView {
     let pagesContainer = UIView()
     private(set) var pageViews: [PageCanvasView] = []
     var singleTapRecognizer: UITapGestureRecognizer?
+    var textSelectionRecognizer: UILongPressGestureRecognizer?
+    var lassoRecognizer: UIPanGestureRecognizer?
     var topOverlayInset: CGFloat = 0
 
     let pageSpacing: CGFloat = 24
@@ -537,6 +617,13 @@ final class MultiPageScrollView: UIScrollView {
             let pageID = spec.id
             pageView.elementsView.onElementsChanged = { [weak coordinator] elements in
                 coordinator?.elementsChanged(elements, pageID: pageID)
+            }
+            pageView.textSelectionView.onHandleMoved = { [weak coordinator, weak pageView] isStart, location in
+                guard let pageView else { return }
+                coordinator?.selectionHandleMoved(isStart: isStart, location: location, on: pageView)
+            }
+            pageView.textSelectionView.onHandleDragEnded = { [weak coordinator] in
+                coordinator?.presentSelectionMenu()
             }
             pagesContainer.addSubview(pageView)
             pageViews.append(pageView)
@@ -604,6 +691,21 @@ final class MultiPageScrollView: UIScrollView {
     }
 }
 
+/// Custom actions offered in the text-selection edit menu that need the
+/// SwiftUI layer (sheets) to complete. Define is routed through the word
+/// lookup callback instead, so it can carry the word's on-page location.
+enum PDFTextSelectionAction {
+    case askAI
+    case translate
+}
+
+/// Where a looked-up word sits on the page, so its underline can be anchored.
+struct WordAnnotationTarget {
+    let pageID: UUID
+    /// Line rects of the word/selection in PDF (media box) space.
+    let pdfRects: [CGRect]
+}
+
 // MARK: - SwiftUI wrapper
 
 struct NotebookCanvasView: UIViewRepresentable {
@@ -629,9 +731,12 @@ struct NotebookCanvasView: UIViewRepresentable {
     let controller: DrawingCanvasController
     let topOverlayInset: CGFloat
     let searchHighlights: [UUID: [PageSearchHighlight]]
+    let annotations: [UUID: [WordAnnotation]]
     let onDrawingChanged: (UUID, Data) -> Void
     let onElementsChanged: (UUID, Data?) -> Void
-    let onWordLookup: (_ word: String, _ context: String) -> Void
+    let onWordLookup: (_ word: String, _ context: String, _ target: WordAnnotationTarget?) -> Void
+    let onTextAction: (_ action: PDFTextSelectionAction, _ text: String, _ context: String) -> Void
+    let onAnnotationTapped: (_ pageID: UUID, _ annotation: WordAnnotation) -> Void
 
     func makeUIView(context: Context) -> MultiPageScrollView {
         let scrollView = MultiPageScrollView()
@@ -667,14 +772,42 @@ struct NotebookCanvasView: UIViewRepresentable {
         touchObserver.onPencilTouch = { [weak controller] in
             controller?.notePencilDetected()
         }
-        touchObserver.onHoldAtStrokeEnd = { [weak coordinator = context.coordinator] in
-            coordinator?.pendingHoldTimestamp = Date()
+        touchObserver.shapeSnapEligibility = { [weak controller] isPencilTouch in
+            guard let controller else { return false }
+            return controller.selectedTool.acceptsInkOptions
+                && (isPencilTouch || controller.fingerDrawingEnabled)
+        }
+        touchObserver.onLiveHoldShape = { [weak coordinator = context.coordinator] points in
+            coordinator?.snapLiveShape(scrollViewPoints: points)
         }
         scrollView.addGestureRecognizer(touchObserver)
 
         let pencilInteraction = UIPencilInteraction()
         pencilInteraction.delegate = context.coordinator
         scrollView.addInteraction(pencilInteraction)
+
+        // Press-and-drag text selection (hand tool only, real PDF text layer).
+        let textSelection = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleTextSelectionGesture(_:))
+        )
+        textSelection.minimumPressDuration = 0.3
+        scrollView.textSelectionRecognizer = textSelection
+        scrollView.addGestureRecognizer(textSelection)
+
+        let editMenu = UIEditMenuInteraction(delegate: context.coordinator)
+        scrollView.addInteraction(editMenu)
+        context.coordinator.editMenuInteraction = editMenu
+
+        // Custom lasso: circles ink strokes AND placed elements together.
+        let lasso = UIPanGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleLassoGesture(_:))
+        )
+        lasso.minimumNumberOfTouches = 1
+        lasso.maximumNumberOfTouches = 1
+        scrollView.lassoRecognizer = lasso
+        scrollView.addGestureRecognizer(lasso)
 
         controller.attach(host: scrollView)
         return scrollView
@@ -699,6 +832,7 @@ struct NotebookCanvasView: UIViewRepresentable {
             )
             coordinator.isLoadingPages = false
             coordinator.appliedHighlights = nil
+            coordinator.appliedAnnotations = nil
             controller.attach(host: scrollView)
             let controller = controller
             DispatchQueue.main.async {
@@ -712,6 +846,27 @@ struct NotebookCanvasView: UIViewRepresentable {
                 pageView.searchHighlightView.setHighlights(
                     searchHighlights[pageView.pageID] ?? []
                 )
+            }
+        }
+
+        if coordinator.appliedAnnotations != annotations {
+            coordinator.appliedAnnotations = annotations
+            for pageView in scrollView.pageViews {
+                pageView.annotationView.setAnnotations(annotations[pageView.pageID] ?? [])
+            }
+        }
+
+        // Leaving the hand tool always drops any active text selection.
+        if controller.selectedTool != .hand, coordinator.activeSelection != nil {
+            DispatchQueue.main.async { [weak coordinator] in
+                coordinator?.clearTextSelection()
+            }
+        }
+
+        // Leaving the lasso tool drops any active group selection.
+        if controller.selectedTool != .lasso, coordinator.lassoGroupActive {
+            DispatchQueue.main.async { [weak coordinator] in
+                coordinator?.clearLassoSelection()
             }
         }
 
@@ -739,17 +894,45 @@ struct NotebookCanvasView: UIViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, PKCanvasViewDelegate, UIScrollViewDelegate,
-                             UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
+                             UIGestureRecognizerDelegate, UIPencilInteractionDelegate,
+                             UIEditMenuInteractionDelegate {
         var parent: NotebookCanvasView
         weak var host: MultiPageScrollView?
+        weak var editMenuInteraction: UIEditMenuInteraction?
         var builtSignature: [PageSignature] = []
         var appliedHighlights: [UUID: [PageSearchHighlight]]?
+        var appliedAnnotations: [UUID: [WordAnnotation]]?
         var isLoadingPages = false
         var isProgrammaticScroll = false
         var lastReportedPageID: UUID?
         var lastScrolledPageID: UUID?
-        var pendingHoldTimestamp: Date?
         private var isReplacingStroke = false
+
+        // Text selection state
+        private(set) var activeSelection: PDFSelection?
+        private weak var selectionPageView: PageCanvasView?
+        private var selectionStartPDFPoint: CGPoint?
+        private var selectionEndPDFPoint: CGPoint?
+        private var dragAnchorPDFPoint: CGPoint?
+
+        // Lasso group state
+        private enum LassoMode {
+            case idle
+            case drawing
+            case moving
+            case scaling(anchor: CGPoint, startPoint: CGPoint)
+        }
+        private(set) var lassoGroupActive = false
+        private var lassoMode: LassoMode = .idle
+        private weak var lassoPageView: PageCanvasView?
+        private var lassoPathPoints: [CGPoint] = []
+        private var lassoStrokeIndices: [Int] = []
+        private var lassoElementIDs: [UUID] = []
+        private var lassoGroupBox: CGRect = .null
+        private var lassoLastPoint: CGPoint = .zero
+        private var lassoPendingStrokeTranslation: CGPoint = .zero
+        private var lassoPendingStrokeScale: CGFloat = 1
+        private var lassoScaleStartBox: CGRect = .null
 
         init(parent: NotebookCanvasView) {
             self.parent = parent
@@ -763,24 +946,45 @@ struct NotebookCanvasView: UIViewRepresentable {
                   let pageView = host.pageViews.first(where: { $0.canvasView === canvasView })
             else { return }
 
-            snapShapeIfHeld(on: canvasView)
             parent.onDrawingChanged(pageView.pageID, canvasView.drawing.dataRepresentation())
             parent.controller.refreshHistoryState()
         }
 
-        private func snapShapeIfHeld(on canvasView: PKCanvasView) {
-            guard let holdTime = pendingHoldTimestamp,
-                  Date().timeIntervalSince(holdTime) < 0.4 else { return }
-            pendingHoldTimestamp = nil
-            guard parent.controller.selectedTool.acceptsInkOptions,
-                  let lastStroke = canvasView.drawing.strokes.last,
-                  let snapped = ShapeSnapper.snappedStroke(from: lastStroke) else { return }
+        /// Draw-and-hold: fires while the touch is still down. Cancels the
+        /// in-flight freehand stroke and commits the fitted shape in its
+        /// place, so the shape is visible before the finger lifts.
+        func snapLiveShape(scrollViewPoints: [CGPoint]) {
+            guard let host,
+                  parent.controller.selectedTool.acceptsInkOptions,
+                  let firstPoint = scrollViewPoints.first else { return }
+
+            let containerPoint = host.convert(firstPoint, to: host.pagesContainer)
+            guard let pageView = host.pageViews.first(where: { $0.frame.contains(containerPoint) })
+            else { return }
+            let pagePoints = scrollViewPoints.map { host.convert($0, to: pageView) }
+
+            guard let inkTool = parent.controller.currentPKTool as? PKInkingTool else { return }
+            let ink = PKInk(inkTool.inkType, color: inkTool.color)
+            guard let snapped = ShapeSnapper.snappedStroke(
+                fromPoints: pagePoints,
+                ink: ink,
+                width: inkTool.width
+            ) else { return }
+
+            // Toggling the drawing recognizer cancels the uncommitted stroke.
+            let drawingRecognizer = pageView.canvasView.drawingGestureRecognizer
+            drawingRecognizer.isEnabled = false
+            drawingRecognizer.isEnabled = true
 
             isReplacingStroke = true
-            var drawing = canvasView.drawing
-            drawing.strokes[drawing.strokes.count - 1] = snapped
-            canvasView.drawing = drawing
+            var drawing = pageView.canvasView.drawing
+            drawing.strokes.append(snapped)
+            pageView.canvasView.drawing = drawing
             isReplacingStroke = false
+
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
+            parent.controller.refreshHistoryState()
         }
 
         func elementsChanged(_ elements: [PageElement], pageID: UUID) {
@@ -798,8 +1002,11 @@ struct NotebookCanvasView: UIViewRepresentable {
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            guard let host = scrollView as? MultiPageScrollView,
-                  !isProgrammaticScroll,
+            guard let host = scrollView as? MultiPageScrollView else { return }
+            if activeSelection != nil, scrollView.isDragging || scrollView.isDecelerating {
+                editMenuInteraction?.dismissMenu()
+            }
+            guard !isProgrammaticScroll,
                   let currentID = host.currentPageID,
                   currentID != lastReportedPageID else { return }
             lastReportedPageID = currentID
@@ -823,6 +1030,12 @@ struct NotebookCanvasView: UIViewRepresentable {
         @objc func handleSingleTap(_ gesture: UITapGestureRecognizer) {
             guard let host else { return }
 
+            // A tap while text is selected just clears the selection.
+            if activeSelection != nil {
+                clearTextSelection()
+                return
+            }
+
             // Ignore taps that landed on an element (its own gestures handle those).
             let hitView = host.hitTest(gesture.location(in: host), with: nil)
             if let hitView, hitView !== host, hitView !== host.pagesContainer,
@@ -845,7 +1058,12 @@ struct NotebookCanvasView: UIViewRepresentable {
                     fontSize: parent.controller.textFontSize
                 )
             case .hand:
-                lookupWord(at: local, in: pageView)
+                // Underlined saved words open their saved definition popup.
+                if let annotation = pageView.annotationView.annotation(at: local) {
+                    parent.onAnnotationTapped(pageView.pageID, annotation)
+                } else {
+                    lookupWord(at: local, in: pageView)
+                }
             default:
                 break
             }
@@ -860,23 +1078,605 @@ struct NotebookCanvasView: UIViewRepresentable {
         }
 
         private func lookupWord(at point: CGPoint, in pageView: PageCanvasView) {
-            guard let pdfPage = pageView.pdfPage, let pageRef = pdfPage.pageRef else { return }
-            let bounds = pageView.bounds
-            let flipped = CGPoint(x: point.x, y: bounds.height - point.y)
-            let transform = pageRef.getDrawingTransform(
-                .mediaBox,
-                rect: bounds,
-                rotate: 0,
-                preserveAspectRatio: true
-            )
-            let pdfPoint = flipped.applying(transform.inverted())
+            guard let pdfPage = pageView.pdfPage,
+                  let pdfPoint = pageView.pdfPagePoint(forViewPoint: point) else { return }
 
             guard let selection = pdfPage.selectionForWord(at: pdfPoint),
                   let raw = selection.string else { return }
             let word = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !word.isEmpty, word.rangeOfCharacter(from: .letters) != nil else { return }
             let context = pdfPage.selectionForLine(at: pdfPoint)?.string ?? ""
-            parent.onWordLookup(word, context)
+            let rects = selection.selectionsByLine()
+                .map { $0.bounds(for: pdfPage) }
+                .filter { $0.width > 0.1 }
+            parent.onWordLookup(
+                word,
+                context,
+                WordAnnotationTarget(pageID: pageView.pageID, pdfRects: rects)
+            )
+        }
+
+        // MARK: Text selection
+
+        @objc func handleTextSelectionGesture(_ gesture: UILongPressGestureRecognizer) {
+            guard let host else { return }
+            let containerPoint = gesture.location(in: host.pagesContainer)
+
+            switch gesture.state {
+            case .began:
+                guard let pageView = host.pageViews.first(where: { $0.frame.contains(containerPoint) }),
+                      pageView.pdfPage != nil else { return }
+                let local = host.pagesContainer.convert(containerPoint, to: pageView)
+                guard let pdfPoint = pageView.pdfPagePoint(forViewPoint: local) else { return }
+                dragAnchorPDFPoint = pdfPoint
+                if let wordSelection = pageView.pdfPage?.selectionForWord(at: pdfPoint),
+                   !(wordSelection.string ?? "").isEmpty {
+                    UISelectionFeedbackGenerator().selectionChanged()
+                    setSelection(wordSelection, on: pageView)
+                }
+            case .changed:
+                guard let pageView = selectionPageView ?? host.pageViews.first(where: { $0.frame.contains(containerPoint) }),
+                      let anchor = dragAnchorPDFPoint,
+                      let page = pageView.pdfPage else { return }
+                let local = host.pagesContainer.convert(containerPoint, to: pageView)
+                guard let pdfPoint = pageView.pdfPagePoint(forViewPoint: local) else { return }
+                if let selection = page.selection(from: anchor, to: pdfPoint),
+                   !(selection.string ?? "").isEmpty {
+                    setSelection(selection, on: pageView)
+                }
+            case .ended:
+                dragAnchorPDFPoint = nil
+                presentSelectionMenu()
+            case .cancelled, .failed:
+                dragAnchorPDFPoint = nil
+            default:
+                break
+            }
+        }
+
+        private func setSelection(_ selection: PDFSelection, on pageView: PageCanvasView) {
+            guard let page = pageView.pdfPage else { return }
+            activeSelection = selection
+            selectionPageView = pageView
+
+            let pdfRects = selection.selectionsByLine()
+                .map { $0.bounds(for: page) }
+                .filter { $0.width > 0.1 && $0.height > 0.1 }
+            pageView.textSelectionView.show(rects: pdfRects.map { pageView.viewRect(forPDFRect: $0) })
+            if let host {
+                for other in host.pageViews where other !== pageView {
+                    other.textSelectionView.clear()
+                }
+            }
+
+            if let firstRect = pdfRects.first, let lastRect = pdfRects.last {
+                selectionStartPDFPoint = CGPoint(x: firstRect.minX + 1, y: firstRect.midY)
+                selectionEndPDFPoint = CGPoint(x: lastRect.maxX - 1, y: lastRect.midY)
+            }
+        }
+
+        func selectionHandleMoved(isStart: Bool, location: CGPoint, on pageView: PageCanvasView) {
+            guard let page = pageView.pdfPage,
+                  let pdfPoint = pageView.pdfPagePoint(forViewPoint: location),
+                  let anchor = isStart ? selectionEndPDFPoint : selectionStartPDFPoint else { return }
+            editMenuInteraction?.dismissMenu()
+            let from = isStart ? pdfPoint : anchor
+            let to = isStart ? anchor : pdfPoint
+            if let selection = page.selection(from: from, to: to),
+               !(selection.string ?? "").isEmpty {
+                setSelection(selection, on: pageView)
+            }
+        }
+
+        func presentSelectionMenu() {
+            guard let host,
+                  let pageView = selectionPageView,
+                  pageView.textSelectionView.hasSelection,
+                  activeSelection != nil else { return }
+            let boundingRect = pageView.textSelectionView.selectionBoundingRect
+            guard !boundingRect.isNull else { return }
+            let rectInHost = pageView.convert(boundingRect, to: host)
+            let configuration = UIEditMenuConfiguration(
+                identifier: nil,
+                sourcePoint: CGPoint(x: rectInHost.midX, y: rectInHost.minY - 8)
+            )
+            editMenuInteraction?.presentEditMenu(with: configuration)
+        }
+
+        func clearTextSelection() {
+            guard activeSelection != nil else { return }
+            activeSelection = nil
+            selectionPageView = nil
+            selectionStartPDFPoint = nil
+            selectionEndPDFPoint = nil
+            dragAnchorPDFPoint = nil
+            host?.pageViews.forEach { $0.textSelectionView.clear() }
+            editMenuInteraction?.dismissMenu()
+        }
+
+        // MARK: Edit menu
+
+        func editMenuInteraction(
+            _ interaction: UIEditMenuInteraction,
+            menuFor configuration: UIEditMenuConfiguration,
+            suggestedActions: [UIMenuElement]
+        ) -> UIMenu? {
+            if lassoGroupActive {
+                return UIMenu(children: [
+                    UIAction(
+                        title: "Duplicate",
+                        image: UIImage(systemName: "plus.square.on.square")
+                    ) { [weak self] _ in
+                        self?.duplicateLassoGroup()
+                    },
+                    UIAction(
+                        title: "Delete",
+                        image: UIImage(systemName: "trash"),
+                        attributes: .destructive
+                    ) { [weak self] _ in
+                        self?.deleteLassoGroup()
+                    }
+                ])
+            }
+
+            guard let selection = activeSelection,
+                  let rawText = selection.string else { return nil }
+            let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            let context = selectionContext(fallback: text)
+
+            let standard: [UIMenuElement] = [
+                UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
+                    UIPasteboard.general.string = text
+                    self?.clearTextSelection()
+                },
+                UIAction(title: "Select All", image: UIImage(systemName: "text.justify")) { [weak self] _ in
+                    self?.selectAllOnCurrentPage()
+                },
+                UIAction(title: "Share…", image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
+                    self?.presentShare(for: text)
+                }
+            ]
+
+            // Capture the selection's location so Define can underline the word.
+            let annotationTarget: WordAnnotationTarget? = {
+                guard let pageView = selectionPageView, let page = pageView.pdfPage else { return nil }
+                let rects = selection.selectionsByLine()
+                    .map { $0.bounds(for: page) }
+                    .filter { $0.width > 0.1 }
+                guard !rects.isEmpty else { return nil }
+                return WordAnnotationTarget(pageID: pageView.pageID, pdfRects: rects)
+            }()
+
+            let custom: [UIMenuElement] = [
+                UIAction(title: "Define", image: UIImage(systemName: "character.book.closed")) { [weak self] _ in
+                    self?.parent.onWordLookup(text, context, annotationTarget)
+                    self?.clearTextSelection()
+                },
+                UIAction(title: "Ask AI", image: UIImage(systemName: "sparkles")) { [weak self] _ in
+                    self?.parent.onTextAction(.askAI, text, context)
+                },
+                UIAction(title: "Translate", image: UIImage(systemName: "globe")) { [weak self] _ in
+                    self?.parent.onTextAction(.translate, text, context)
+                },
+                UIAction(title: "Highlight", image: UIImage(systemName: "highlighter")) { [weak self] _ in
+                    self?.highlightActiveSelection()
+                },
+                UIAction(title: "Add Note", image: UIImage(systemName: "note.text.badge.plus")) { [weak self] _ in
+                    self?.addNoteForActiveSelection(text: text)
+                }
+            ]
+
+            return UIMenu(children: standard + custom)
+        }
+
+        private func selectionContext(fallback: String) -> String {
+            guard let page = selectionPageView?.pdfPage,
+                  let start = selectionStartPDFPoint,
+                  let line = page.selectionForLine(at: start)?.string,
+                  !line.isEmpty else { return fallback }
+            return line
+        }
+
+        private func selectAllOnCurrentPage() {
+            guard let pageView = selectionPageView, let page = pageView.pdfPage else { return }
+            let pageBounds = page.bounds(for: .mediaBox)
+            guard let selection = page.selection(for: pageBounds),
+                  !(selection.string ?? "").isEmpty else { return }
+            setSelection(selection, on: pageView)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.presentSelectionMenu()
+            }
+        }
+
+        private func presentShare(for text: String) {
+            guard let host, let presenter = topViewController() else { return }
+            let activity = UIActivityViewController(activityItems: [text], applicationActivities: nil)
+            if let popover = activity.popoverPresentationController {
+                popover.sourceView = host
+                if let pageView = selectionPageView {
+                    popover.sourceRect = pageView.convert(
+                        pageView.textSelectionView.selectionBoundingRect,
+                        to: host
+                    )
+                } else {
+                    popover.sourceRect = CGRect(
+                        x: host.bounds.midX,
+                        y: host.bounds.midY,
+                        width: 1,
+                        height: 1
+                    )
+                }
+            }
+            presenter.present(activity, animated: true)
+            clearTextSelection()
+        }
+
+        private func topViewController() -> UIViewController? {
+            guard let root = host?.window?.rootViewController else { return nil }
+            var top = root
+            while let presented = top.presentedViewController {
+                top = presented
+            }
+            return top
+        }
+
+        /// Lays permanent highlighter ink over the selected lines, so the
+        /// highlight is erasable, undoable, and included in exports.
+        private func highlightActiveSelection() {
+            guard let selection = activeSelection,
+                  let pageView = selectionPageView,
+                  let page = pageView.pdfPage else { return }
+
+            var drawing = pageView.canvasView.drawing
+            let ink = PKInk(.marker, color: UIColor.systemYellow.withAlphaComponent(0.45))
+
+            for line in selection.selectionsByLine() {
+                let viewRect = pageView.viewRect(forPDFRect: line.bounds(for: page))
+                guard viewRect.width > 1, viewRect.height > 1 else { continue }
+                let strokeSize = CGSize(width: viewRect.height, height: viewRect.height)
+                var points: [PKStrokePoint] = []
+                var x = viewRect.minX
+                var index = 0
+                while x < viewRect.maxX {
+                    points.append(strokePoint(at: CGPoint(x: x, y: viewRect.midY), index: index, size: strokeSize))
+                    x += 6
+                    index += 1
+                }
+                points.append(strokePoint(at: CGPoint(x: viewRect.maxX, y: viewRect.midY), index: index, size: strokeSize))
+                guard points.count >= 2 else { continue }
+                drawing.strokes.append(
+                    PKStroke(ink: ink, path: PKStrokePath(controlPoints: points, creationDate: Date()))
+                )
+            }
+
+            pageView.canvasView.drawing = drawing
+            parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
+            parent.controller.refreshHistoryState()
+            clearTextSelection()
+        }
+
+        private func strokePoint(at location: CGPoint, index: Int, size: CGSize) -> PKStrokePoint {
+            PKStrokePoint(
+                location: location,
+                timeOffset: TimeInterval(index) * 0.01,
+                size: size,
+                opacity: 1,
+                force: 1,
+                azimuth: 0,
+                altitude: .pi / 2
+            )
+        }
+
+        /// Drops an editable text box just below the selection, pre-filled with
+        /// the selected text.
+        private func addNoteForActiveSelection(text: String) {
+            guard let selection = activeSelection,
+                  let pageView = selectionPageView,
+                  let page = pageView.pdfPage,
+                  let lastLine = selection.selectionsByLine().last else { return }
+            let viewRect = pageView.viewRect(forPDFRect: lastLine.bounds(for: page))
+            let origin = CGPoint(
+                x: max(viewRect.minX, 8),
+                y: min(viewRect.maxY + 10, pageView.bounds.height - 60)
+            )
+            clearTextSelection()
+            pageView.elementsView.addTextElement(
+                at: origin,
+                fontSize: parent.controller.textFontSize,
+                initialText: text
+            )
+        }
+
+        // MARK: Lasso group selection
+
+        @objc func handleLassoGesture(_ gesture: UIPanGestureRecognizer) {
+            guard let host else { return }
+            let containerPoint = gesture.location(in: host.pagesContainer)
+
+            switch gesture.state {
+            case .began:
+                lassoBegan(containerPoint: containerPoint, host: host)
+            case .changed:
+                lassoChanged(containerPoint: containerPoint)
+            case .ended:
+                lassoEnded()
+            case .cancelled, .failed:
+                if case .drawing = lassoMode {
+                    lassoPageView?.lassoOverlayView.clearPath()
+                }
+                lassoMode = .idle
+            default:
+                break
+            }
+        }
+
+        private func lassoBegan(containerPoint: CGPoint, host: MultiPageScrollView) {
+            if lassoGroupActive, let pageView = lassoPageView {
+                let local = host.pagesContainer.convert(containerPoint, to: pageView)
+                let handleTolerance: CGFloat = 30
+
+                // Corner grab → scale about the opposite corner.
+                let corners = [
+                    CGPoint(x: lassoGroupBox.minX, y: lassoGroupBox.minY),
+                    CGPoint(x: lassoGroupBox.maxX, y: lassoGroupBox.minY),
+                    CGPoint(x: lassoGroupBox.minX, y: lassoGroupBox.maxY),
+                    CGPoint(x: lassoGroupBox.maxX, y: lassoGroupBox.maxY)
+                ]
+                for (index, corner) in corners.enumerated()
+                where hypot(local.x - corner.x, local.y - corner.y) < handleTolerance {
+                    let anchor = corners[3 - index]
+                    lassoMode = .scaling(anchor: anchor, startPoint: local)
+                    lassoScaleStartBox = lassoGroupBox
+                    lassoPendingStrokeScale = 1
+                    lassoPendingStrokeTranslation = .zero
+                    editMenuInteraction?.dismissMenu()
+                    return
+                }
+
+                // Inside the box → move the whole group.
+                if lassoGroupBox.insetBy(dx: -10, dy: -10).contains(local) {
+                    lassoMode = .moving
+                    lassoLastPoint = local
+                    lassoPendingStrokeTranslation = .zero
+                    lassoPendingStrokeScale = 1
+                    editMenuInteraction?.dismissMenu()
+                    return
+                }
+
+                clearLassoSelection()
+            }
+
+            guard let pageView = host.pageViews.first(where: { $0.frame.contains(containerPoint) }) else {
+                lassoMode = .idle
+                return
+            }
+            lassoPageView = pageView
+            lassoMode = .drawing
+            lassoPathPoints = [host.pagesContainer.convert(containerPoint, to: pageView)]
+            pageView.lassoOverlayView.updatePath(lassoPathPoints)
+        }
+
+        private func lassoChanged(containerPoint: CGPoint) {
+            guard let host, let pageView = lassoPageView else { return }
+            let local = host.pagesContainer.convert(containerPoint, to: pageView)
+
+            switch lassoMode {
+            case .drawing:
+                lassoPathPoints.append(local)
+                pageView.lassoOverlayView.updatePath(lassoPathPoints)
+            case .moving:
+                let delta = CGPoint(x: local.x - lassoLastPoint.x, y: local.y - lassoLastPoint.y)
+                lassoLastPoint = local
+                lassoPendingStrokeTranslation.x += delta.x
+                lassoPendingStrokeTranslation.y += delta.y
+                lassoGroupBox = lassoGroupBox.offsetBy(dx: delta.x, dy: delta.y)
+                pageView.elementsView.transformElements(
+                    ids: lassoElementIDs,
+                    translation: delta,
+                    scale: 1,
+                    anchor: .zero
+                )
+                pageView.lassoOverlayView.showGroup(box: lassoGroupBox)
+            case .scaling(let anchor, let startPoint):
+                let startDistance = max(hypot(startPoint.x - anchor.x, startPoint.y - anchor.y), 1)
+                let currentDistance = max(hypot(local.x - anchor.x, local.y - anchor.y), 1)
+                let totalScale = min(max(currentDistance / startDistance, 0.2), 8)
+                let stepScale = totalScale / lassoPendingStrokeScale
+                lassoPendingStrokeScale = totalScale
+                pageView.elementsView.transformElements(
+                    ids: lassoElementIDs,
+                    translation: .zero,
+                    scale: stepScale,
+                    anchor: anchor
+                )
+                lassoGroupBox = scaled(lassoScaleStartBox, by: totalScale, about: anchor)
+                pageView.lassoOverlayView.showGroup(box: lassoGroupBox)
+            case .idle:
+                break
+            }
+        }
+
+        private func lassoEnded() {
+            guard let pageView = lassoPageView else {
+                lassoMode = .idle
+                return
+            }
+
+            switch lassoMode {
+            case .drawing:
+                pageView.lassoOverlayView.clearPath()
+                finishLassoSelection(on: pageView)
+            case .moving:
+                applyPendingStrokeTransform(
+                    translation: lassoPendingStrokeTranslation,
+                    scale: 1,
+                    anchor: .zero,
+                    on: pageView
+                )
+                presentLassoMenu()
+            case .scaling(let anchor, _):
+                applyPendingStrokeTransform(
+                    translation: .zero,
+                    scale: lassoPendingStrokeScale,
+                    anchor: anchor,
+                    on: pageView
+                )
+                presentLassoMenu()
+            case .idle:
+                break
+            }
+            lassoMode = .idle
+        }
+
+        private func finishLassoSelection(on pageView: PageCanvasView) {
+            guard lassoPathPoints.count >= 8 else {
+                clearLassoSelection()
+                return
+            }
+            let path = UIBezierPath()
+            path.move(to: lassoPathPoints[0])
+            for point in lassoPathPoints.dropFirst() {
+                path.addLine(to: point)
+            }
+            path.close()
+
+            // Strokes: selected when most of their sampled points fall inside.
+            var strokeIndices: [Int] = []
+            let strokes = pageView.canvasView.drawing.strokes
+            for (index, stroke) in strokes.enumerated() {
+                let samples = Array(stroke.path.interpolatedPoints(by: .distance(12)))
+                guard !samples.isEmpty else { continue }
+                let insideCount = samples.filter {
+                    path.contains($0.location.applying(stroke.transform))
+                }.count
+                if Double(insideCount) / Double(samples.count) > 0.5 {
+                    strokeIndices.append(index)
+                }
+            }
+
+            let elementIDs = pageView.elementsView.elementIDs(withCentersIn: path)
+
+            guard !strokeIndices.isEmpty || !elementIDs.isEmpty else {
+                clearLassoSelection()
+                return
+            }
+
+            var box = CGRect.null
+            for index in strokeIndices {
+                box = box.union(strokes[index].renderBounds)
+            }
+            for id in elementIDs {
+                if let frame = pageView.elementsView.elementFrame(id: id) {
+                    box = box.union(frame)
+                }
+            }
+            guard !box.isNull else {
+                clearLassoSelection()
+                return
+            }
+
+            lassoStrokeIndices = strokeIndices
+            lassoElementIDs = elementIDs
+            lassoGroupBox = box.insetBy(dx: -8, dy: -8)
+            lassoGroupActive = true
+            UISelectionFeedbackGenerator().selectionChanged()
+            pageView.lassoOverlayView.showGroup(box: lassoGroupBox)
+            presentLassoMenu()
+        }
+
+        private func applyPendingStrokeTransform(
+            translation: CGPoint,
+            scale: CGFloat,
+            anchor: CGPoint,
+            on pageView: PageCanvasView
+        ) {
+            guard !lassoStrokeIndices.isEmpty,
+                  translation != .zero || abs(scale - 1) > 0.001 else { return }
+            let transform = CGAffineTransform(
+                a: scale, b: 0, c: 0, d: scale,
+                tx: anchor.x * (1 - scale) + translation.x,
+                ty: anchor.y * (1 - scale) + translation.y
+            )
+            var drawing = pageView.canvasView.drawing
+            for index in lassoStrokeIndices where drawing.strokes.indices.contains(index) {
+                drawing.strokes[index].transform =
+                    drawing.strokes[index].transform.concatenating(transform)
+            }
+            isReplacingStroke = true
+            pageView.canvasView.drawing = drawing
+            isReplacingStroke = false
+            parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
+            parent.controller.refreshHistoryState()
+        }
+
+        private func scaled(_ rect: CGRect, by scale: CGFloat, about anchor: CGPoint) -> CGRect {
+            CGRect(
+                x: anchor.x + (rect.origin.x - anchor.x) * scale,
+                y: anchor.y + (rect.origin.y - anchor.y) * scale,
+                width: rect.width * scale,
+                height: rect.height * scale
+            )
+        }
+
+        func presentLassoMenu() {
+            guard lassoGroupActive, let host, let pageView = lassoPageView else { return }
+            let rectInHost = pageView.convert(lassoGroupBox, to: host)
+            let configuration = UIEditMenuConfiguration(
+                identifier: nil,
+                sourcePoint: CGPoint(x: rectInHost.midX, y: rectInHost.minY - 8)
+            )
+            editMenuInteraction?.presentEditMenu(with: configuration)
+        }
+
+        func clearLassoSelection() {
+            lassoMode = .idle
+            lassoPathPoints = []
+            lassoStrokeIndices = []
+            lassoElementIDs = []
+            lassoGroupBox = .null
+            if lassoGroupActive {
+                lassoGroupActive = false
+                editMenuInteraction?.dismissMenu()
+            }
+            host?.pageViews.forEach { $0.lassoOverlayView.clearAll() }
+            lassoPageView = nil
+        }
+
+        private func duplicateLassoGroup() {
+            guard let pageView = lassoPageView else { return }
+            if !lassoStrokeIndices.isEmpty {
+                var drawing = pageView.canvasView.drawing
+                let offset = CGAffineTransform(translationX: 24, y: 24)
+                for index in lassoStrokeIndices where drawing.strokes.indices.contains(index) {
+                    var copy = drawing.strokes[index]
+                    copy.transform = copy.transform.concatenating(offset)
+                    drawing.strokes.append(copy)
+                }
+                isReplacingStroke = true
+                pageView.canvasView.drawing = drawing
+                isReplacingStroke = false
+                parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
+            }
+            pageView.elementsView.duplicateElements(ids: lassoElementIDs)
+            clearLassoSelection()
+        }
+
+        private func deleteLassoGroup() {
+            guard let pageView = lassoPageView else { return }
+            if !lassoStrokeIndices.isEmpty {
+                var drawing = pageView.canvasView.drawing
+                for index in lassoStrokeIndices.sorted(by: >)
+                where drawing.strokes.indices.contains(index) {
+                    drawing.strokes.remove(at: index)
+                }
+                isReplacingStroke = true
+                pageView.canvasView.drawing = drawing
+                isReplacingStroke = false
+                parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
+            }
+            pageView.elementsView.removeElements(ids: lassoElementIDs)
+            clearLassoSelection()
         }
 
         // MARK: Gesture cooperation
@@ -894,6 +1694,180 @@ struct NotebookCanvasView: UIViewRepresentable {
 
         func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
             parent.controller.handlePencilDoubleTap()
+        }
+    }
+}
+
+// MARK: - Word annotation underlines
+
+/// Draws colored underlines for saved dictionary words. Rects live in PDF
+/// space, so underlines track their words through zoom and relayout.
+final class AnnotationUnderlineView: UIView {
+    var pageRef: CGPDFPage?
+    private var annotations: [WordAnnotation] = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        isUserInteractionEnabled = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setAnnotations(_ annotations: [WordAnnotation]) {
+        guard self.annotations != annotations else { return }
+        self.annotations = annotations
+        setNeedsDisplay()
+    }
+
+    /// The annotation whose word area contains the given view-space point.
+    func annotation(at point: CGPoint) -> WordAnnotation? {
+        guard let transform = pageTransform() else { return nil }
+        for annotation in annotations {
+            for pdfRect in annotation.cgRects {
+                let rect = viewRect(for: pdfRect, transform: transform).insetBy(dx: -4, dy: -6)
+                if rect.contains(point) {
+                    return annotation
+                }
+            }
+        }
+        return nil
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard !annotations.isEmpty,
+              let transform = pageTransform(),
+              let context = UIGraphicsGetCurrentContext() else { return }
+
+        for annotation in annotations {
+            let color = UIColor(hexString: annotation.colorHex)
+            context.setFillColor(color.cgColor)
+            for pdfRect in annotation.cgRects {
+                let wordRect = viewRect(for: pdfRect, transform: transform)
+                guard wordRect.width > 1 else { continue }
+                let underline = CGRect(
+                    x: wordRect.minX,
+                    y: wordRect.maxY + 0.5,
+                    width: wordRect.width,
+                    height: 2.4
+                )
+                context.addPath(UIBezierPath(roundedRect: underline, cornerRadius: 1.2).cgPath)
+                context.fillPath()
+            }
+        }
+    }
+
+    private func pageTransform() -> CGAffineTransform? {
+        guard let pageRef else { return nil }
+        return pageRef.getDrawingTransform(
+            .mediaBox,
+            rect: bounds,
+            rotate: 0,
+            preserveAspectRatio: true
+        )
+    }
+
+    private func viewRect(for pdfRect: CGRect, transform: CGAffineTransform) -> CGRect {
+        let cornerA = pdfRect.origin.applying(transform)
+        let cornerB = CGPoint(x: pdfRect.maxX, y: pdfRect.maxY).applying(transform)
+        return CGRect(
+            x: min(cornerA.x, cornerB.x),
+            y: bounds.height - max(cornerA.y, cornerB.y),
+            width: abs(cornerB.x - cornerA.x),
+            height: abs(cornerB.y - cornerA.y)
+        )
+    }
+}
+
+// MARK: - Lasso overlay
+
+/// Visual layer for the custom lasso: the in-progress dashed path while
+/// circling, and the dashed group box with corner knobs once a selection
+/// exists. Purely visual — gestures are handled by the scroll view.
+final class LassoOverlayView: UIView {
+    private var pathPoints: [CGPoint] = []
+    private var groupBox: CGRect = .null
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        isUserInteractionEnabled = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func updatePath(_ points: [CGPoint]) {
+        pathPoints = points
+        setNeedsDisplay()
+    }
+
+    func clearPath() {
+        pathPoints = []
+        setNeedsDisplay()
+    }
+
+    func showGroup(box: CGRect) {
+        groupBox = box
+        setNeedsDisplay()
+    }
+
+    func clearAll() {
+        pathPoints = []
+        groupBox = .null
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+
+        if pathPoints.count > 1 {
+            let path = UIBezierPath()
+            path.move(to: pathPoints[0])
+            for point in pathPoints.dropFirst() {
+                path.addLine(to: point)
+            }
+            context.setStrokeColor(UIColor.systemBlue.cgColor)
+            context.setLineWidth(2)
+            context.setLineDash(phase: 0, lengths: [6, 4])
+            context.addPath(path.cgPath)
+            context.strokePath()
+        }
+
+        guard !groupBox.isNull else { return }
+        context.setStrokeColor(UIColor.systemBlue.cgColor)
+        context.setLineWidth(1.5)
+        context.setLineDash(phase: 0, lengths: [6, 4])
+        context.addPath(UIBezierPath(roundedRect: groupBox, cornerRadius: 6).cgPath)
+        context.strokePath()
+        context.setLineDash(phase: 0, lengths: [])
+
+        let knobRadius: CGFloat = 6
+        let corners = [
+            CGPoint(x: groupBox.minX, y: groupBox.minY),
+            CGPoint(x: groupBox.maxX, y: groupBox.minY),
+            CGPoint(x: groupBox.minX, y: groupBox.maxY),
+            CGPoint(x: groupBox.maxX, y: groupBox.maxY)
+        ]
+        for corner in corners {
+            let knobRect = CGRect(
+                x: corner.x - knobRadius,
+                y: corner.y - knobRadius,
+                width: knobRadius * 2,
+                height: knobRadius * 2
+            )
+            context.setFillColor(UIColor.white.cgColor)
+            context.fillEllipse(in: knobRect)
+            context.setStrokeColor(UIColor.systemBlue.cgColor)
+            context.setLineWidth(2)
+            context.strokeEllipse(in: knobRect)
         }
     }
 }

@@ -1,6 +1,6 @@
 import XCTest
 import SwiftData
-@testable import SmartNotes
+@testable import Gloss
 
 @MainActor
 final class DictionaryCacheServiceTests: XCTestCase {

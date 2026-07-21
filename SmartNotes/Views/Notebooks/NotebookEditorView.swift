@@ -4,6 +4,52 @@ import PhotosUI
 import SwiftData
 import SwiftUI
 import UIKit
+#if canImport(Translation)
+import Translation
+#endif
+
+/// Selected PDF text routed into the AI explanation sheet.
+struct AISelectionRequest: Identifiable {
+    let id = UUID()
+    let text: String
+    let context: String
+}
+
+/// Presents the system translation sheet on iOS 17.4+, with a graceful
+/// message on older systems.
+private struct TranslationSheetModifier: ViewModifier {
+    @Binding var text: String?
+    var onUnavailable: () -> Void
+
+    private var isPresented: Binding<Bool> {
+        Binding(
+            get: { text != nil },
+            set: { if !$0 { text = nil } }
+        )
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if canImport(Translation)
+        if #available(iOS 17.4, *) {
+            content.translationPresentation(isPresented: isPresented, text: text ?? "")
+        } else {
+            fallback(content)
+        }
+        #else
+        fallback(content)
+        #endif
+    }
+
+    private func fallback(_ content: Content) -> some View {
+        content.onChange(of: text) { _, newValue in
+            if newValue != nil {
+                text = nil
+                onUnavailable()
+            }
+        }
+    }
+}
 
 struct NotebookEditorView: View {
     @Environment(\.modelContext) private var modelContext
@@ -16,6 +62,8 @@ struct NotebookEditorView: View {
     @State private var selectedPageID: UUID?
     @State private var showsPageRail = false
     @State private var inkPaletteExpanded = true
+    @State private var toolHelpVisible = true
+    @State private var toolHelpDismissTask: Task<Void, Never>?
     @State private var pagePendingDeletion: NotebookPage?
     @State private var showingClearConfirmation = false
     @State private var sharedDocument: SharedDocument?
@@ -23,6 +71,12 @@ struct NotebookEditorView: View {
     @State private var errorMessage: String?
     @State private var saveTask: Task<Void, Never>?
     @State private var definitionRequest: DefinitionLookupRequest?
+    @State private var pendingWordTarget: WordAnnotationTarget?
+    @State private var activeAnnotation: ActiveAnnotation?
+    @State private var toastMessage: String?
+    @State private var toastTask: Task<Void, Never>?
+    @State private var aiRequest: AISelectionRequest?
+    @State private var translationText: String?
     @State private var showingPhotoPicker = false
     @State private var photoItem: PhotosPickerItem?
 
@@ -70,8 +124,26 @@ struct NotebookEditorView: View {
         }
         .background(Color(.secondarySystemBackground))
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar { navigationToolbar }
+        .overlay(alignment: .bottom) {
+            if let toastMessage {
+                Text(toastMessage)
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .liquidGlass(in: Capsule())
+                    .padding(.bottom, 24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(.snappy(duration: 0.3), value: toastMessage)
         .onAppear {
+            // A vocabulary entry can ask to open this notebook at its page.
+            if let jumpPageID = AppNavigator.shared.consumePendingPage(for: notebook.id) {
+                selectedPageID = jumpPageID
+            }
             if selectedPageID == nil {
                 selectedPageID = orderedPages.first?.id
             }
@@ -99,8 +171,48 @@ struct NotebookEditorView: View {
             try? modelContext.save()
         }
         .sheet(item: $definitionRequest) { request in
-            DefinitionSheet(request: request)
+            DefinitionSheet(
+                request: request,
+                notebookContext: NotebookDefinitionContext(
+                    notebookID: notebook.id,
+                    notebookTitle: notebook.title,
+                    pageID: pendingWordTarget?.pageID ?? selectedPage?.id,
+                    pageNumber: pageNumber(for: pendingWordTarget?.pageID ?? selectedPage?.id),
+                    canAnnotate: pendingWordTarget != nil,
+                    onVocabResult: { newlyAdded, colorHex, definition in
+                        // Adding to vocab always underlines the tapped word too.
+                        addWordAnnotation(
+                            definition: definition,
+                            colorHex: colorHex,
+                            onlyIfUnmarked: true
+                        )
+                        showToast(newlyAdded ? "Added to Vocab" : "Already in Vocab")
+                    }
+                )
+            )
         }
+        .sheet(item: $activeAnnotation) { active in
+            AnnotationDetailSheet(
+                annotation: active.annotation,
+                onUpdate: { updated in
+                    replaceAnnotation(updated, onPageID: active.pageID)
+                },
+                onDelete: {
+                    removeAnnotation(active.annotation.id, onPageID: active.pageID)
+                    activeAnnotation = nil
+                }
+            )
+        }
+        .sheet(item: $aiRequest) { request in
+            AIExplanationSheet(
+                selectedText: request.text,
+                context: request.context,
+                onInsert: nil
+            )
+        }
+        .modifier(TranslationSheetModifier(text: $translationText) {
+            errorMessage = "Translation requires iOS 17.4 or later."
+        })
         .sheet(isPresented: $showingExportOptions) {
             ExportOptionsSheet(
                 pages: orderedPages,
@@ -110,30 +222,22 @@ struct NotebookEditorView: View {
             )
         }
         .photosPicker(isPresented: $showingPhotoPicker, selection: $photoItem, matching: .images)
-        .confirmationDialog(
-            "Delete this page?",
-            isPresented: pageDeletionBinding,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Page", role: .destructive) {
+        .alert("Delete this page?", isPresented: pageDeletionBinding) {
+            Button("Cancel", role: .cancel) {
+                pagePendingDeletion = nil
+            }
+            Button("Delete", role: .destructive) {
                 if let pagePendingDeletion {
                     delete(pagePendingDeletion)
                 }
                 pagePendingDeletion = nil
             }
-            Button("Cancel", role: .cancel) {
-                pagePendingDeletion = nil
-            }
         } message: {
             Text("The page and everything on it will be removed. This action cannot be undone.")
         }
-        .confirmationDialog(
-            "Clear all drawing from this page?",
-            isPresented: $showingClearConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Clear Drawing", role: .destructive, action: clearCurrentPage)
+        .alert("Clear all drawing from this page?", isPresented: $showingClearConfirmation) {
             Button("Cancel", role: .cancel) {}
+            Button("Clear", role: .destructive, action: clearCurrentPage)
         } message: {
             Text("All ink on this page will be erased. This action cannot be undone.")
         }
@@ -178,14 +282,27 @@ struct NotebookEditorView: View {
                 controller: drawingController,
                 topOverlayInset: 104,
                 searchHighlights: searchHighlights,
+                annotations: pageAnnotations,
                 onDrawingChanged: saveDrawing,
                 onElementsChanged: saveElements,
-                onWordLookup: { word, context in
+                onWordLookup: { word, context, target in
+                    pendingWordTarget = target
                     definitionRequest = DefinitionLookupRequest(
                         rawSelection: word,
                         context: context,
                         sourceNoteTitle: notebook.title
                     )
+                },
+                onTextAction: { action, text, context in
+                    switch action {
+                    case .askAI:
+                        aiRequest = AISelectionRequest(text: text, context: context)
+                    case .translate:
+                        translationText = text
+                    }
+                },
+                onAnnotationTapped: { pageID, annotation in
+                    activeAnnotation = ActiveAnnotation(pageID: pageID, annotation: annotation)
                 }
             )
             .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -212,7 +329,7 @@ struct NotebookEditorView: View {
             if drawingController.selectedTool.acceptsInkOptions && inkPaletteExpanded {
                 inkPalette
                     .transition(.move(edge: .top).combined(with: .opacity))
-            } else if !toolHelpText.isEmpty {
+            } else if !toolHelpText.isEmpty && toolHelpVisible {
                 Text(toolHelpText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -228,6 +345,24 @@ struct NotebookEditorView: View {
         .animation(.snappy(duration: 0.25), value: drawingController.selectedTool)
         .animation(.snappy(duration: 0.25), value: inkPaletteExpanded)
         .animation(.snappy(duration: 0.25), value: showingSearch)
+        .animation(.easeOut(duration: 0.4), value: toolHelpVisible)
+        .onChange(of: drawingController.selectedTool) { _, _ in
+            showToolHelpBriefly()
+        }
+        .onAppear {
+            showToolHelpBriefly()
+        }
+    }
+
+    /// The tool hint fades away on its own after a few seconds.
+    private func showToolHelpBriefly() {
+        toolHelpDismissTask?.cancel()
+        toolHelpVisible = true
+        toolHelpDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            toolHelpVisible = false
+        }
     }
 
     private var searchBar: some View {
@@ -273,9 +408,6 @@ struct NotebookEditorView: View {
             .disabled(searchMatches.count < 2)
             .accessibilityLabel("Next Match")
 
-            Divider()
-                .frame(height: 20)
-
             Button(action: closeSearch) {
                 Image(systemName: "xmark")
                     .font(.system(size: 13, weight: .semibold))
@@ -319,8 +451,8 @@ struct NotebookEditorView: View {
                     }
                 } label: {
                     Image(systemName: "ruler")
-                        .font(.system(size: 15, weight: .medium))
-                        .frame(width: 38, height: 34)
+                        .font(.system(size: 17, weight: .medium))
+                        .frame(width: 44, height: 40)
                         .foregroundStyle(drawingController.isRulerActive ? Color.accentColor : .primary)
                         .background {
                             if drawingController.isRulerActive {
@@ -336,8 +468,8 @@ struct NotebookEditorView: View {
                     showingPhotoPicker = true
                 } label: {
                     Image(systemName: "photo")
-                        .font(.system(size: 15, weight: .medium))
-                        .frame(width: 38, height: 34)
+                        .font(.system(size: 17, weight: .medium))
+                        .frame(width: 44, height: 40)
                         .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
@@ -365,8 +497,8 @@ struct NotebookEditorView: View {
             }
         } label: {
             Image(systemName: tool.systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .frame(width: 38, height: 34)
+                .font(.system(size: 17, weight: .medium))
+                .frame(width: 44, height: 40)
                 .foregroundStyle(isSelected ? .white : .primary)
                 .background {
                     if isSelected {
@@ -389,8 +521,8 @@ struct NotebookEditorView: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .frame(width: 38, height: 34)
+                .font(.system(size: 17, weight: .medium))
+                .frame(width: 44, height: 40)
                 .foregroundStyle(enabled ? Color.primary : Color.secondary.opacity(0.45))
         }
         .buttonStyle(.plain)
@@ -406,9 +538,7 @@ struct NotebookEditorView: View {
 
             ColorPicker("Custom ink color", selection: inkColorBinding, supportsOpacity: false)
                 .labelsHidden()
-
-            Divider()
-                .frame(height: 24)
+                .padding(.trailing, 6)
 
             Image(systemName: "line.diagonal")
                 .foregroundStyle(.secondary)
@@ -457,7 +587,7 @@ struct NotebookEditorView: View {
                 ? "Drag to scroll and pinch to zoom."
                 : "Tap a word to look it up; drag to scroll."
         case .eraser: "Draw over strokes to erase them."
-        case .lasso: "Circle strokes to select and move them."
+        case .lasso: "Circle ink, text boxes, or photos to select and move them together."
         case .text: "Tap anywhere on the page to add a text box."
         case .pen, .pencil, .highlighter: ""
         }
@@ -694,13 +824,10 @@ struct NotebookEditorView: View {
                                         pdfPage: pdfPage(for: page)
                                     )
                                     .overlay {
-                                        RoundedRectangle(cornerRadius: 5)
-                                            .strokeBorder(
-                                                selectedPage?.id == page.id
-                                                    ? Color.accentColor
-                                                    : Color.black.opacity(0.12),
-                                                lineWidth: selectedPage?.id == page.id ? 3 : 1
-                                            )
+                                        if selectedPage?.id == page.id {
+                                            RoundedRectangle(cornerRadius: 5)
+                                                .strokeBorder(Color.accentColor, lineWidth: 3)
+                                        }
                                     }
                                     Text("\(page.orderIndex + 1)")
                                         .font(.caption.monospacedDigit())
@@ -729,7 +856,6 @@ struct NotebookEditorView: View {
                 }
             }
 
-            Divider()
             Button(action: addBlankPage) {
                 Label("Add Page", systemImage: "plus")
                     .frame(maxWidth: .infinity)
@@ -739,13 +865,8 @@ struct NotebookEditorView: View {
         }
         .frame(width: 172)
         .frame(maxHeight: .infinity)
-        .background(.regularMaterial)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(Color.primary.opacity(0.12))
-                .frame(width: 0.5)
-        }
-        .shadow(color: .black.opacity(0.14), radius: 10, x: 4)
+        .background(.thinMaterial)
+        .shadow(color: .black.opacity(0.10), radius: 14, x: 6)
     }
 
     private func pdfPage(for page: NotebookPage) -> PDFPage? {
@@ -843,6 +964,94 @@ struct NotebookEditorView: View {
             try? await Task.sleep(for: .milliseconds(450))
             guard !Task.isCancelled else { return }
             try? modelContext.save()
+        }
+    }
+
+    // MARK: - Word annotations
+
+    private var pageAnnotations: [UUID: [WordAnnotation]] {
+        var result: [UUID: [WordAnnotation]] = [:]
+        for page in orderedPages {
+            let annotations = WordAnnotation.decoded(from: page.annotationsData)
+            if !annotations.isEmpty {
+                result[page.id] = annotations
+            }
+        }
+        return result
+    }
+
+    private func pageNumber(for pageID: UUID?) -> Int? {
+        guard let pageID,
+              let page = orderedPages.first(where: { $0.id == pageID }) else { return nil }
+        return page.orderIndex + 1
+    }
+
+    private func addWordAnnotation(
+        definition: String,
+        colorHex: String,
+        onlyIfUnmarked: Bool = false
+    ) {
+        guard let target = pendingWordTarget,
+              let page = pages.first(where: { $0.id == target.pageID }),
+              let word = definitionRequest?.rawSelection
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !word.isEmpty,
+              !target.pdfRects.isEmpty else { return }
+
+        var annotations = WordAnnotation.decoded(from: page.annotationsData)
+        let alreadyMarked = annotations.contains { existing in
+            existing.word.lowercased() == word.lowercased()
+                && existing.cgRects.contains { rect in
+                    target.pdfRects.contains { $0.intersects(rect) }
+                }
+        }
+        if alreadyMarked {
+            if !onlyIfUnmarked {
+                showToast("Already underlined")
+            }
+            return
+        }
+
+        annotations.append(
+            WordAnnotation.make(
+                word: word,
+                definition: definition,
+                colorHex: colorHex,
+                pdfRects: target.pdfRects
+            )
+        )
+        page.annotationsData = WordAnnotation.encoded(annotations)
+        notebook.updatedAt = .now
+        try? modelContext.save()
+    }
+
+    private func replaceAnnotation(_ updated: WordAnnotation, onPageID pageID: UUID) {
+        guard let page = pages.first(where: { $0.id == pageID }) else { return }
+        var annotations = WordAnnotation.decoded(from: page.annotationsData)
+        guard let index = annotations.firstIndex(where: { $0.id == updated.id }) else { return }
+        annotations[index] = updated
+        page.annotationsData = WordAnnotation.encoded(annotations)
+        try? modelContext.save()
+        if let active = activeAnnotation, active.annotation.id == updated.id {
+            activeAnnotation = ActiveAnnotation(pageID: pageID, annotation: updated)
+        }
+    }
+
+    private func removeAnnotation(_ annotationID: UUID, onPageID pageID: UUID) {
+        guard let page = pages.first(where: { $0.id == pageID }) else { return }
+        var annotations = WordAnnotation.decoded(from: page.annotationsData)
+        annotations.removeAll { $0.id == annotationID }
+        page.annotationsData = WordAnnotation.encoded(annotations)
+        try? modelContext.save()
+    }
+
+    private func showToast(_ message: String) {
+        toastTask?.cancel()
+        toastMessage = message
+        toastTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.8))
+            guard !Task.isCancelled else { return }
+            toastMessage = nil
         }
     }
 
@@ -1024,11 +1233,10 @@ private struct ExportOptionsSheet: View {
                     VStack(spacing: 5) {
                         NotebookPageThumbnailView(page: page, pdfPage: pdfPageProvider(page))
                             .overlay {
-                                RoundedRectangle(cornerRadius: 5)
-                                    .strokeBorder(
-                                        isSelected ? Color.accentColor : Color.black.opacity(0.12),
-                                        lineWidth: isSelected ? 3 : 1
-                                    )
+                                if isSelected {
+                                    RoundedRectangle(cornerRadius: 5)
+                                        .strokeBorder(Color.accentColor, lineWidth: 3)
+                                }
                             }
                             .overlay(alignment: .topTrailing) {
                                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -1051,6 +1259,121 @@ private struct ExportOptionsSheet: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Word annotation popup
+
+struct ActiveAnnotation: Identifiable {
+    let pageID: UUID
+    let annotation: WordAnnotation
+    var id: UUID { annotation.id }
+}
+
+/// Small popup shown when the user taps an underlined word: the saved
+/// definition plus edit, recolor, and remove actions.
+private struct AnnotationDetailSheet: View {
+    let annotation: WordAnnotation
+    let onUpdate: (WordAnnotation) -> Void
+    let onDelete: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var isEditingDefinition = false
+    @State private var editedDefinition = ""
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(annotation.word)
+                            .font(.system(.title, design: .rounded, weight: .bold))
+                        Spacer()
+                        Text(annotation.createdAt, format: .dateTime.month(.abbreviated).day())
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if isEditingDefinition {
+                        TextEditor(text: $editedDefinition)
+                            .frame(minHeight: 90)
+                            .padding(6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color(.secondarySystemBackground))
+                            )
+                        Button("Save Definition") {
+                            var updated = annotation
+                            updated.definition = editedDefinition
+                            onUpdate(updated)
+                            isEditingDefinition = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Text(annotation.definition.isEmpty ? "No definition saved." : annotation.definition)
+                            .font(.body)
+                            .foregroundStyle(annotation.definition.isEmpty ? .secondary : .primary)
+                    }
+
+                    HStack(spacing: 10) {
+                        Text("Underline")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(underlineColorPresets, id: \.hex) { preset in
+                            colorSwatch(preset)
+                        }
+                    }
+
+                    HStack(spacing: 12) {
+                        Button(isEditingDefinition ? "Cancel Edit" : "Edit Definition") {
+                            if isEditingDefinition {
+                                isEditingDefinition = false
+                            } else {
+                                editedDefinition = annotation.definition
+                                isEditingDefinition = true
+                            }
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Remove", role: .destructive) {
+                            onDelete()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.height(320), .medium])
+        .presentationDragIndicator(.visible)
+    }
+
+    private func colorSwatch(_ preset: (name: String, hex: String)) -> some View {
+        let isSelected = annotation.colorHex.uppercased() == preset.hex.uppercased()
+        return Button {
+            var updated = annotation
+            updated.colorHex = preset.hex
+            onUpdate(updated)
+        } label: {
+            Circle()
+                .fill(Color(uiColor: UIColor(hexString: preset.hex)))
+                .frame(width: 24, height: 24)
+                .overlay {
+                    if isSelected {
+                        Circle().strokeBorder(Color.primary.opacity(0.6), lineWidth: 2.5)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(preset.name) underline")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

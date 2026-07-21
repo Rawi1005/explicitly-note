@@ -5,15 +5,21 @@ import UIKit
 /// triangle, or ellipse) — used for GoodNotes-style "draw and hold" snapping.
 enum ShapeSnapper {
 
-    static func snappedStroke(from stroke: PKStroke) -> PKStroke? {
-        let sampled = Array(stroke.path.interpolatedPoints(by: .distance(6)))
-        let points = sampled.map(\.location)
+    /// Fits the freehand `points` (already in page coordinates) to a clean
+    /// shape and builds a stroke with the given ink and width. Called while
+    /// the finger/Pencil is still down, so the shape appears before release.
+    static func snappedStroke(
+        fromPoints rawPoints: [CGPoint],
+        ink: PKInk,
+        width: CGFloat
+    ) -> PKStroke? {
+        let points = resample(rawPoints, spacing: 6)
         guard points.count >= 8 else { return nil }
 
         let perimeter = pathLength(points)
         guard perimeter > 40 else { return nil }
 
-        let averageWidth = max(sampled.map(\.size.width).reduce(0, +) / CGFloat(sampled.count), 1)
+        let strokeWidth = max(width, 1)
         let closingDistance = hypot(
             points[0].x - points[points.count - 1].x,
             points[0].y - points[points.count - 1].y
@@ -22,24 +28,43 @@ enum ShapeSnapper {
 
         if !isClosed {
             guard let (start, end) = fitLine(points, length: perimeter) else { return nil }
-            return buildStroke(along: [start, end], closed: false, ink: stroke.ink, width: averageWidth)
+            return buildStroke(along: [start, end], closed: false, ink: ink, width: strokeWidth)
         }
 
         let corners = simplify(points, epsilon: max(perimeter * 0.03, 8))
         switch corners.count {
         case 3:
-            return buildStroke(along: corners, closed: true, ink: stroke.ink, width: averageWidth)
+            return buildStroke(along: corners, closed: true, ink: ink, width: strokeWidth)
         case 4:
             return buildStroke(
                 along: snapQuadrilateral(corners),
                 closed: true,
-                ink: stroke.ink,
-                width: averageWidth
+                ink: ink,
+                width: strokeWidth
             )
         default:
             guard let ellipse = fitEllipse(points) else { return nil }
-            return buildStroke(along: ellipse, closed: true, ink: stroke.ink, width: averageWidth)
+            return buildStroke(along: ellipse, closed: true, ink: ink, width: strokeWidth)
         }
+    }
+
+    /// Evenly respaces raw touch samples so fit quality doesn't depend on
+    /// drawing speed.
+    private static func resample(_ points: [CGPoint], spacing: CGFloat) -> [CGPoint] {
+        guard let first = points.first else { return [] }
+        var result = [first]
+        var last = first
+        for point in points.dropFirst() {
+            let segment = hypot(point.x - last.x, point.y - last.y)
+            if segment >= spacing {
+                result.append(point)
+                last = point
+            }
+        }
+        if let final = points.last, final != last {
+            result.append(final)
+        }
+        return result
     }
 
     // MARK: - Fitting

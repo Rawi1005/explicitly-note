@@ -51,13 +51,9 @@ struct SettingsView: View {
         } footer: {
             Text("Looked-up definitions are cached for 7 days so they stay available offline.")
         }
-        .confirmationDialog(
-            "Clear all \(cacheCount) cached definitions?",
-            isPresented: $showingClearConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Clear Cache", role: .destructive, action: clearCache)
+        .alert("Clear all \(cacheCount) cached definitions?", isPresented: $showingClearConfirmation) {
             Button("Cancel", role: .cancel) {}
+            Button("Clear", role: .destructive, action: clearCache)
         } message: {
             Text("Words will need an internet connection the next time you look them up.")
         }

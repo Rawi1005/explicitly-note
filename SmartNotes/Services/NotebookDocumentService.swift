@@ -313,24 +313,161 @@ enum NotebookDocumentService {
     }
 
     static func drawElements(_ elements: [PageElement], notebookID: UUID) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
         for element in elements {
+            context.saveGState()
+            // Rotate around the element's center.
+            let center = CGPoint(x: element.frame.midX, y: element.frame.midY)
+            context.translateBy(x: center.x, y: center.y)
+            context.rotate(by: element.rotationAngle)
+            let localFrame = CGRect(
+                x: -element.frame.width / 2,
+                y: -element.frame.height / 2,
+                width: element.frame.width,
+                height: element.frame.height
+            )
+
             switch element.kind {
             case .text:
-                guard !element.text.isEmpty else { continue }
+                guard !element.text.isEmpty else {
+                    context.restoreGState()
+                    continue
+                }
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = element.textAlignment
                 let attributed = NSAttributedString(
                     string: element.text,
                     attributes: [
-                        .font: UIFont.systemFont(ofSize: element.fontSize),
-                        .foregroundColor: UIColor(hexString: element.colorHex)
+                        .font: element.font,
+                        .foregroundColor: UIColor(hexString: element.colorHex),
+                        .paragraphStyle: paragraph
                     ]
                 )
-                attributed.draw(in: element.frame)
+                attributed.draw(in: localFrame)
             case .image:
                 guard let fileName = element.imageFileName,
-                      let image = elementImage(named: fileName, notebookID: notebookID) else { continue }
-                image.draw(in: element.frame)
+                      var image = elementImage(named: fileName, notebookID: notebookID) else {
+                    context.restoreGState()
+                    continue
+                }
+                if let crop = element.cropRect, let cgImage = image.cgImage {
+                    let pixelCrop = CGRect(
+                        x: crop.origin.x * CGFloat(cgImage.width),
+                        y: crop.origin.y * CGFloat(cgImage.height),
+                        width: crop.width * CGFloat(cgImage.width),
+                        height: crop.height * CGFloat(cgImage.height)
+                    )
+                    if let croppedCG = cgImage.cropping(to: pixelCrop) {
+                        image = UIImage(cgImage: croppedCG, scale: image.scale, orientation: image.imageOrientation)
+                    }
+                }
+                image.draw(in: localFrame)
+            }
+            context.restoreGState()
+        }
+    }
+
+    // MARK: - Duplication
+
+    @discardableResult
+    static func duplicateNotebook(_ notebook: Notebook, in modelContext: ModelContext) throws -> Notebook {
+        let copy = Notebook(
+            title: notebook.title + " Copy",
+            pageCount: notebook.pageCount,
+            folderID: notebook.folderID,
+            colorHex: notebook.colorHex,
+            pdfData: notebook.pdfData
+        )
+        modelContext.insert(copy)
+
+        let notebookID = notebook.id
+        let descriptor = FetchDescriptor<NotebookPage>(
+            predicate: #Predicate { $0.notebookID == notebookID }
+        )
+        for page in try modelContext.fetch(descriptor) {
+            modelContext.insert(
+                NotebookPage(
+                    notebookID: copy.id,
+                    orderIndex: page.orderIndex,
+                    kind: page.kind,
+                    pdfPageIndex: page.pdfPageIndex,
+                    width: page.width,
+                    height: page.height,
+                    drawingData: page.drawingData,
+                    elementsData: page.elementsData
+                )
+            )
+        }
+
+        // Element images are addressed by (notebookID, fileName), so copy the folder.
+        let sourceFolder = imagesFolder(for: notebook.id)
+        if FileManager.default.fileExists(atPath: sourceFolder.path) {
+            let targetFolder = imagesFolder(for: copy.id)
+            try? FileManager.default.createDirectory(
+                at: targetFolder.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? FileManager.default.copyItem(at: sourceFolder, to: targetFolder)
+        }
+
+        try modelContext.save()
+        return copy
+    }
+
+    // MARK: - Folders
+
+    @discardableResult
+    static func createFolder(
+        named name: String,
+        colorHex: String,
+        parentFolderID: UUID?,
+        in modelContext: ModelContext
+    ) throws -> NotebookFolder {
+        let folder = NotebookFolder(name: name, colorHex: colorHex, parentFolderID: parentFolderID)
+        modelContext.insert(folder)
+        try modelContext.save()
+        return folder
+    }
+
+    /// Deletes a folder. Its notebooks and subfolders move up to the folder's
+    /// parent rather than being destroyed.
+    static func deleteFolder(_ folder: NotebookFolder, in modelContext: ModelContext) throws {
+        let folderID = folder.id
+        let parentID = folder.parentFolderID
+
+        let notebooks = try modelContext.fetch(
+            FetchDescriptor<Notebook>(predicate: #Predicate { $0.folderID == folderID })
+        )
+        for notebook in notebooks {
+            notebook.folderID = parentID
+        }
+        let subfolders = try modelContext.fetch(
+            FetchDescriptor<NotebookFolder>(predicate: #Predicate { $0.parentFolderID == folderID })
+        )
+        for subfolder in subfolders {
+            subfolder.parentFolderID = parentID
+        }
+
+        modelContext.delete(folder)
+        try modelContext.save()
+    }
+
+    /// True if `candidate` is `folder` itself or one of its descendants —
+    /// used to prevent dropping a folder into its own subtree.
+    static func folder(
+        _ folder: NotebookFolder,
+        contains candidateID: UUID,
+        allFolders: [NotebookFolder]
+    ) -> Bool {
+        if folder.id == candidateID { return true }
+        var frontier = [folder.id]
+        while let current = frontier.popLast() {
+            for child in allFolders where child.parentFolderID == current {
+                if child.id == candidateID { return true }
+                frontier.append(child.id)
             }
         }
+        return false
     }
 
     static func drawPDFPage(_ page: PDFPage, in bounds: CGRect, context: CGContext) {
