@@ -1,17 +1,34 @@
 import SwiftData
 import SwiftUI
 
+/// Extra context and callbacks provided when the definition sheet is opened
+/// from a notebook page (rather than a note), enabling Add to Slide underlines
+/// and vocabulary provenance.
+struct NotebookDefinitionContext {
+    let notebookID: UUID
+    let notebookTitle: String
+    let pageID: UUID?
+    let pageNumber: Int?
+    /// True when the tapped word's on-page location is known (underlining possible).
+    let canAnnotate: Bool
+    /// Vocab save finished; the word also gets underlined on the page.
+    /// `newlyAdded` is false for duplicates.
+    let onVocabResult: (_ newlyAdded: Bool, _ colorHex: String, _ definition: String) -> Void
+}
+
 /// Bottom sheet showing dictionary definitions for a text selection,
 /// with actions to insert the definition into the note, save the word
 /// to vocabulary, or ask for an AI explanation.
 struct DefinitionSheet: View {
     let request: DefinitionLookupRequest
     var onInsertDefinition: ((String) -> Void)? = nil
+    var notebookContext: NotebookDefinitionContext? = nil
 
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @State private var viewModel = DictionaryLookupViewModel()
     @State private var showingAIExplanation = false
+    @AppStorage("smartnotes.underline.colorHex") private var underlineColorHex = "#0A84FF"
 
     var body: some View {
         Group {
@@ -25,6 +42,18 @@ struct DefinitionSheet: View {
             case .notInDictionary(let word):
                 notInDictionaryView(word: word)
             }
+        }
+        .overlay(alignment: .topTrailing) {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title3)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .accessibilityLabel("Close")
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
@@ -220,7 +249,105 @@ struct DefinitionSheet: View {
 
     // MARK: - Action bar
 
+    @ViewBuilder
     private func actionBar(entries: [DictionaryEntry]) -> some View {
+        if let context = notebookContext {
+            notebookActionBar(entries: entries, context: context)
+        } else {
+            noteActionBar(entries: entries)
+        }
+    }
+
+    /// Notebook flow: clean text buttons. Add to Vocab both saves the word
+    /// and underlines it on the page in the chosen color.
+    private func notebookActionBar(
+        entries: [DictionaryEntry],
+        context: NotebookDefinitionContext
+    ) -> some View {
+        VStack(spacing: 12) {
+            if context.canAnnotate {
+                HStack(spacing: 10) {
+                    Text("Underline")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(underlineColorPresets, id: \.hex) { preset in
+                        underlineSwatch(preset)
+                    }
+                    ColorPicker(
+                        "Custom underline color",
+                        selection: underlineColorBinding,
+                        supportsOpacity: false
+                    )
+                    .labelsHidden()
+                    Spacer()
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button("Add to Vocab") {
+                    addToVocab(entries: entries, context: context)
+                }
+                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity)
+
+                Button("Explain with AI") {
+                    showingAIExplanation = true
+                }
+                .buttonStyle(.bordered)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .padding()
+        .background(.bar)
+    }
+
+    private func addToVocab(entries: [DictionaryEntry], context: NotebookDefinitionContext) {
+        let definition = viewModel.shortDefinitionText(from: entries)
+        let newlyAdded = !viewModel.isSaved
+        if newlyAdded {
+            viewModel.saveToVocabulary(
+                entries: entries,
+                sourceNoteTitle: context.notebookTitle,
+                details: VocabularySaveDetails(
+                    sourceNotebookID: context.notebookID,
+                    sourcePageID: context.pageID,
+                    pageNumber: context.pageNumber,
+                    underlineColorHex: underlineColorHex
+                )
+            )
+        }
+        context.onVocabResult(newlyAdded, underlineColorHex, definition)
+        dismiss()
+    }
+
+    private func underlineSwatch(_ preset: (name: String, hex: String)) -> some View {
+        let isSelected = underlineColorHex.uppercased() == preset.hex.uppercased()
+        return Button {
+            underlineColorHex = preset.hex
+        } label: {
+            Circle()
+                .fill(Color(uiColor: UIColor(hexString: preset.hex)))
+                .frame(width: 22, height: 22)
+                .overlay {
+                    if isSelected {
+                        Circle().strokeBorder(Color.primary.opacity(0.6), lineWidth: 2)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(preset.name) underline")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var underlineColorBinding: Binding<Color> {
+        Binding(
+            get: { Color(uiColor: UIColor(hexString: underlineColorHex)) },
+            set: { underlineColorHex = UIColor($0).hexString }
+        )
+    }
+
+    /// Original note flow, unchanged.
+    private func noteActionBar(entries: [DictionaryEntry]) -> some View {
         VStack(spacing: 10) {
             // The signature feature: drop the definition straight into the note.
             if onInsertDefinition != nil, let text = viewModel.insertText(from: entries) {

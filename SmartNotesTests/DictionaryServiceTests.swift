@@ -1,5 +1,5 @@
 import XCTest
-@testable import SmartNotes
+@testable import Gloss
 
 final class DictionaryServiceTests: XCTestCase {
     private var service: DictionaryService!

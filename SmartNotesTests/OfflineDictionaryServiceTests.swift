@@ -1,6 +1,6 @@
 import XCTest
 import SQLite3
-@testable import SmartNotes
+@testable import Gloss
 
 /// These tests build their own tiny SQLite database in `setUp`, matching
 /// the `entries` schema from `Tools/build_dictionary.py`, rather than

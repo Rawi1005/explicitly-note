@@ -8,9 +8,13 @@ extension View {
         if #available(iOS 26.0, *) {
             self.glassEffect(.regular, in: shape)
         } else {
+            // Borderless fallback: no outline, just frost and a whisper of depth.
             self
-                .background(shape.fill(.ultraThinMaterial))
-                .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+                .background(
+                    shape
+                        .fill(.ultraThinMaterial)
+                        .shadow(color: .black.opacity(0.10), radius: 8, y: 2)
+                )
         }
     }
 }

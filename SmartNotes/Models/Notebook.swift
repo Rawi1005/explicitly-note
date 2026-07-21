@@ -8,6 +8,10 @@ final class Notebook {
     var createdAt: Date
     var updatedAt: Date
     var pageCount: Int
+    /// Folder containing this notebook; nil = library root.
+    var folderID: UUID?
+    /// Optional accent color tag shown on the card.
+    var colorHex: String?
     @Attribute(.externalStorage) var pdfData: Data?
 
     init(
@@ -16,6 +20,8 @@ final class Notebook {
         createdAt: Date = .now,
         updatedAt: Date = .now,
         pageCount: Int = 0,
+        folderID: UUID? = nil,
+        colorHex: String? = nil,
         pdfData: Data? = nil
     ) {
         self.id = id
@@ -23,7 +29,36 @@ final class Notebook {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.pageCount = pageCount
+        self.folderID = folderID
+        self.colorHex = colorHex
         self.pdfData = pdfData
+    }
+}
+
+@Model
+final class NotebookFolder {
+    @Attribute(.unique) var id: UUID
+    var name: String
+    var colorHex: String
+    /// Parent folder; nil = library root. Enables nesting.
+    var parentFolderID: UUID?
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        name: String = "New Folder",
+        colorHex: String = "#007AFF",
+        parentFolderID: UUID? = nil,
+        createdAt: Date = .now,
+        updatedAt: Date = .now
+    ) {
+        self.id = id
+        self.name = name
+        self.colorHex = colorHex
+        self.parentFolderID = parentFolderID
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
     }
 }
 
@@ -43,6 +78,8 @@ final class NotebookPage {
     var height: Double
     @Attribute(.externalStorage) var drawingData: Data?
     @Attribute(.externalStorage) var elementsData: Data?
+    /// JSON-encoded [WordAnnotation]: underlined dictionary words.
+    @Attribute(.externalStorage) var annotationsData: Data?
 
     var kind: NotebookPageKind {
         get { NotebookPageKind(rawValue: kindRawValue) ?? .blank }

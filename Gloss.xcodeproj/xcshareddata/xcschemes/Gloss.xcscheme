@@ -15,10 +15,10 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "FC5935945D0D94578A47DD5C"
-               BuildableName = "SmartNotes.app"
-               BlueprintName = "SmartNotes"
-               ReferencedContainer = "container:SmartNotes.xcodeproj">
+               BlueprintIdentifier = "A4F8373F4A27DF8D4C57B888"
+               BuildableName = "Gloss.app"
+               BlueprintName = "Gloss"
+               ReferencedContainer = "container:Gloss.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -32,10 +32,10 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "FC5935945D0D94578A47DD5C"
-            BuildableName = "SmartNotes.app"
-            BlueprintName = "SmartNotes"
-            ReferencedContainer = "container:SmartNotes.xcodeproj">
+            BlueprintIdentifier = "A4F8373F4A27DF8D4C57B888"
+            BuildableName = "Gloss.app"
+            BlueprintName = "Gloss"
+            ReferencedContainer = "container:Gloss.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
@@ -44,10 +44,10 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "841DFBFCA1BDD3C5A27E19F4"
+               BlueprintIdentifier = "12BA51B50CCDE4EF7B78CBD6"
                BuildableName = "SmartNotesTests.xctest"
                BlueprintName = "SmartNotesTests"
-               ReferencedContainer = "container:SmartNotes.xcodeproj">
+               ReferencedContainer = "container:Gloss.xcodeproj">
             </BuildableReference>
          </TestableReference>
          <TestableReference
@@ -55,10 +55,10 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "7FCAC61319EC84C763D64583"
+               BlueprintIdentifier = "6B8CF04FC110139F2BB6EB40"
                BuildableName = "SmartNotesUITests.xctest"
                BlueprintName = "SmartNotesUITests"
-               ReferencedContainer = "container:SmartNotes.xcodeproj">
+               ReferencedContainer = "container:Gloss.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -79,10 +79,10 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "FC5935945D0D94578A47DD5C"
-            BuildableName = "SmartNotes.app"
-            BlueprintName = "SmartNotes"
-            ReferencedContainer = "container:SmartNotes.xcodeproj">
+            BlueprintIdentifier = "A4F8373F4A27DF8D4C57B888"
+            BuildableName = "Gloss.app"
+            BlueprintName = "Gloss"
+            ReferencedContainer = "container:Gloss.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
       <CommandLineArguments>
@@ -98,10 +98,10 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "FC5935945D0D94578A47DD5C"
-            BuildableName = "SmartNotes.app"
-            BlueprintName = "SmartNotes"
-            ReferencedContainer = "container:SmartNotes.xcodeproj">
+            BlueprintIdentifier = "A4F8373F4A27DF8D4C57B888"
+            BuildableName = "Gloss.app"
+            BlueprintName = "Gloss"
+            ReferencedContainer = "container:Gloss.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>
