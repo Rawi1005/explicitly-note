@@ -20,8 +20,10 @@ struct DefinitionSheet: View {
                 loadingView
             case .failed(let error):
                 errorView(error)
-            case .loaded(let entries, _, let isStale):
-                loadedView(entries: entries, isStale: isStale)
+            case .dictionary(let entries, let source):
+                loadedView(entries: entries, source: source)
+            case .notInDictionary(let word):
+                notInDictionaryView(word: word)
             }
         }
         .presentationDetents([.medium, .large])
@@ -34,7 +36,11 @@ struct DefinitionSheet: View {
             viewModel.audioPlayer.stop()
         }
         .sheet(isPresented: $showingAIExplanation) {
-            AIExplanationSheet(selectedText: request.rawSelection, context: request.context)
+            AIExplanationSheet(
+                selectedText: request.rawSelection,
+                context: request.context,
+                onInsert: onInsertDefinition
+            )
         }
     }
 
@@ -95,12 +101,10 @@ struct DefinitionSheet: View {
 
     // MARK: - Loaded
 
-    private func loadedView(entries: [DictionaryEntry], isStale: Bool) -> some View {
+    private func loadedView(entries: [DictionaryEntry], source: DefinitionSource) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if isStale {
-                    staleBanner
-                }
+                sourceLabel(source)
                 if let first = entries.first {
                     header(for: first)
                 }
@@ -109,7 +113,7 @@ struct DefinitionSheet: View {
                         MeaningSectionView(meaning: meaning)
                     }
                 }
-                footer(for: entries)
+                footer(for: entries, source: source)
             }
             .padding(.horizontal)
             .padding(.top, 24)
@@ -120,22 +124,29 @@ struct DefinitionSheet: View {
         }
     }
 
-    private var staleBanner: some View {
-        Label {
-            Text("Offline — showing a cached result from \(cachedDateText)")
-        } icon: {
-            Image(systemName: "wifi.slash")
-        }
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 10))
+    /// Small "Offline dictionary" / "Dictionary + online" caption so the
+    /// user always knows where the shown definition came from.
+    private func sourceLabel(_ source: DefinitionSource) -> some View {
+        Label(source.label, systemImage: source == .offlineDictionary ? "checkmark.icloud" : "icloud")
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 
-    private var cachedDateText: String {
-        guard let date = viewModel.staleResultDate else { return "earlier" }
-        return date.formatted(date: .abbreviated, time: .omitted)
+    // MARK: - Not in dictionary
+
+    private func notInDictionaryView(word: String) -> some View {
+        ContentUnavailableView {
+            Label("Not in the dictionary", systemImage: "sparkles")
+        } description: {
+            Text("\u{201C}\(word)\u{201D} isn't in the offline dictionary — it may be a technical term or acronym.")
+        } actions: {
+            Button {
+                showingAIExplanation = true
+            } label: {
+                Label("Explain with AI", systemImage: "sparkles")
+            }
+            .buttonStyle(.borderedProminent)
+        }
     }
 
     private func header(for entry: DictionaryEntry) -> some View {
@@ -178,14 +189,21 @@ struct DefinitionSheet: View {
         viewModel.audioPlayer.isPlaying && viewModel.audioPlayer.currentURL == url
     }
 
-    private func footer(for entries: [DictionaryEntry]) -> some View {
-        // De-duplicate source URLs across entries, keeping order.
+    private func footer(for entries: [DictionaryEntry], source: DefinitionSource) -> some View {
+        // De-duplicate source URLs across entries, keeping order. These only
+        // appear once an online enrichment has run.
         let urls = entries.flatMap { $0.sourceUrls ?? [] }
         var seen = Set<String>()
         let unique = urls.filter { seen.insert($0).inserted }
 
+        // Credit the real source: definitions always come from the bundled
+        // offline dictionary; only audio/links are added from the API online.
+        let credit = source == .offlineDictionary
+            ? "Definitions from the bundled offline dictionary."
+            : "Definitions from the bundled offline dictionary · pronunciation & links from DictionaryAPI.dev."
+
         return VStack(alignment: .leading, spacing: 4) {
-            Text("Source: DictionaryAPI.dev")
+            Text(credit)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             ForEach(unique, id: \.self) { urlString in

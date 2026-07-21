@@ -139,4 +139,13 @@ enum SampleDictionary {
         }
     }
 }
+
+/// Offline dictionary stand-in for previews/tests: returns the sample
+/// "drink" entry and treats every other word as not-in-dictionary, without
+/// touching the real bundled SQLite database.
+struct MockOfflineDictionaryService: OfflineDictionaryServiceProtocol {
+    func lookup(word: String) async -> [DictionaryEntry] {
+        word == "drink" ? SampleDictionary.drinkEntries : []
+    }
+}
 #endif

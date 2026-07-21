@@ -5,6 +5,10 @@ import SwiftUI
 struct AIExplanationSheet: View {
     let selectedText: String
     let context: String
+    /// Optional "Insert into Note" callback. When nil (e.g. looking up a
+    /// word from Vocabulary with no note in context), the insert button is
+    /// hidden.
+    var onInsert: ((String) -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var level: ExplanationLevel
@@ -15,9 +19,10 @@ struct AIExplanationSheet: View {
 
     private let service: AIExplanationService = MockAIExplanationService()
 
-    init(selectedText: String, context: String) {
+    init(selectedText: String, context: String, onInsert: ((String) -> Void)? = nil) {
         self.selectedText = selectedText
         self.context = context
+        self.onInsert = onInsert
         // Seed the pickers from the user's saved defaults (Settings).
         let defaults = UserDefaults.standard
         let levelRaw = defaults.string(forKey: SettingsKeys.defaultExplanationLevel) ?? ""
@@ -96,6 +101,17 @@ struct AIExplanationSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                         .padding(.vertical, 4)
+
+                        if let onInsert {
+                            Button {
+                                onInsert(explanation.text)
+                                dismiss()
+                            } label: {
+                                Label("Insert into Note", systemImage: "text.insert")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
                     }
                 }
 

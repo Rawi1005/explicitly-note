@@ -56,8 +56,12 @@ private struct NoteEditorContent: View {
             .presentationDetents([.medium, .large])
         }
         .sheet(item: $viewModel.aiExplanationRequest) { request in
-            AIExplanationSheet(selectedText: request.selectedText, context: request.context)
-                .presentationDetents([.medium, .large])
+            AIExplanationSheet(
+                selectedText: request.selectedText,
+                context: request.context,
+                onInsert: { viewModel.insertDefinition($0) }
+            )
+            .presentationDetents([.medium, .large])
         }
     }
 

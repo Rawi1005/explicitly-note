@@ -2,34 +2,51 @@ import Foundation
 import Observation
 import SwiftData
 
-/// Drives the definition sheet: normalizes the selection, orchestrates
-/// cache-first lookup with an offline stale fallback, and tracks
-/// vocabulary-saved state and pronunciation playback.
+/// Drives the definition sheet with an offline-first flow:
+///
+///   1. Resolve the selection against the bundled offline dictionary via
+///      `LookupCoordinator` — this is instant, free, and needs no network.
+///   2. If found, show it immediately, then try to enrich it (audio,
+///      phonetics, source links) from the online dictionary in the
+///      background. Enrichment is best-effort and never blocks or replaces
+///      the offline definitions themselves.
+///   3. If the word isn't in the offline dictionary, surface the
+///      "Explain with AI" escalation instead of an error.
+///
+/// Also tracks vocabulary-saved state and pronunciation playback.
 @MainActor
 @Observable
 final class DictionaryLookupViewModel {
     enum State {
         case idle
         case loading
-        case loaded([DictionaryEntry], fromCache: Bool, isStale: Bool)
-        case failed(DictionaryError)
+        case dictionary([DictionaryEntry], source: DefinitionSource)
+        case notInDictionary(word: String)
+        case failed(DictionaryError)   // invalid selection only
     }
 
     private(set) var state: State = .idle
     private(set) var isSaved = false
-    /// Fetch date of the stale cached result shown while offline,
-    /// used by the "Offline — showing a cached result from …" banner.
-    private(set) var staleResultDate: Date?
 
     let audioPlayer = AudioPlayerService()
 
-    private let dictionaryService: DictionaryServiceProtocol
+    private let coordinator: LookupCoordinator
+    private let onlineService: DictionaryServiceProtocol
     private var cacheService: DictionaryCacheService?
     private var vocabularyService: VocabularyService?
     private var normalizedWord: String?
 
-    init(dictionaryService: DictionaryServiceProtocol = DictionaryService()) {
-        self.dictionaryService = dictionaryService
+    /// `offline` defaults to the bundled SQLite dictionary; if that resource
+    /// is missing (e.g. a build misconfiguration) it falls back to an
+    /// always-empty offline service so every lookup still resolves — it
+    /// just always escalates to "not in dictionary" rather than crashing or
+    /// hanging. `offline` is injectable so tests/previews can supply a mock.
+    init(
+        offline: OfflineDictionaryServiceProtocol? = SQLiteOfflineDictionaryService.bundled(),
+        onlineService: DictionaryServiceProtocol = DictionaryService()
+    ) {
+        self.coordinator = LookupCoordinator(offline: offline ?? EmptyOfflineDictionaryService())
+        self.onlineService = onlineService
     }
 
     /// The model context is only available once the view appears, so the
@@ -43,45 +60,73 @@ final class DictionaryLookupViewModel {
 
     func lookup(raw: String) async {
         state = .loading
-        staleResultDate = nil
 
-        let normalized: String
-        do {
-            normalized = try WordNormalizer.normalize(raw)
-        } catch let error as DictionaryError {
+        let outcome = await coordinator.resolve(selection: raw)
+        switch outcome {
+        case .invalid(let error):
+            normalizedWord = nil
             state = .failed(error)
-            return
-        } catch {
-            state = .failed(.invalidSelection(reason: error.localizedDescription))
+
+        case .notInDictionary(let word):
+            normalizedWord = word
+            refreshSavedState()
+            state = .notInDictionary(word: word)
+
+        case .found(let entries):
+            // The offline service stores/returns the normalized word.
+            normalizedWord = entries.first?.word
+            refreshSavedState()
+            state = .dictionary(entries, source: .offlineDictionary)
+            await enrich(base: entries, word: entries.first?.word)
+        }
+    }
+
+    // MARK: - Online enrichment
+
+    /// Best-effort enrichment of an already-shown offline result with
+    /// online audio/phonetics/source links. Never required: a missing or
+    /// failing network simply leaves the offline result on screen as-is.
+    /// Definitions themselves always stay the trusted offline ones — only
+    /// `phonetic`/`phonetics`/`sourceUrls` come from the online response.
+    private func enrich(base: [DictionaryEntry], word: String?) async {
+        guard let word else { return }
+        // If the user has since looked up something else, don't clobber it.
+        guard isStillShowing(word: word) else { return }
+
+        if let cached = cacheService?.cachedResult(for: word) {
+            applyEnrichment(base: base, online: cached.entries)
             return
         }
-        normalizedWord = normalized
-        refreshSavedState()
 
-        // 1. Fresh cache hit: show immediately, no network request.
-        let cached = cacheService?.cachedResult(for: normalized)
-        if let cached, !cached.isExpired {
-            state = .loaded(cached.entries, fromCache: true, isStale: false)
-            return
-        }
-
-        // 2. Miss or expired: go to the network.
         do {
-            let entries = try await dictionaryService.lookup(word: normalized)
-            cacheService?.store(entries: entries, for: normalized)
-            state = .loaded(entries, fromCache: false, isStale: false)
-        } catch let error as DictionaryError {
-            // 3. Network failed but an expired copy exists: show it stale
-            //    rather than an error — an old definition beats no definition.
-            if let cached, isNetworkFailure(error) {
-                staleResultDate = cached.fetchedAt
-                state = .loaded(cached.entries, fromCache: true, isStale: true)
-            } else {
-                state = .failed(error)
-            }
+            let online = try await onlineService.lookup(word: word)
+            cacheService?.store(entries: online, for: word)
+            applyEnrichment(base: base, online: online)
         } catch {
-            state = .failed(.network(description: error.localizedDescription))
+            // Silent: stay on the offline result.
         }
+    }
+
+    private func applyEnrichment(base: [DictionaryEntry], online: [DictionaryEntry]) {
+        guard let o = online.first else { return }
+        let merged = base.map { e in
+            DictionaryEntry(
+                word: e.word,
+                phonetic: o.displayPhonetic,
+                phonetics: o.phonetics,
+                meanings: e.meanings,
+                sourceUrls: o.sourceUrls
+            )
+        }
+        guard isStillShowing(word: base.first?.word) else { return }
+        state = .dictionary(merged, source: .onlineDictionary)
+    }
+
+    /// True when `state` is still `.dictionary` for the given word, i.e. the
+    /// user hasn't navigated away to a different lookup in the meantime.
+    private func isStillShowing(word: String?) -> Bool {
+        guard let word, case .dictionary(let entries, _) = state else { return false }
+        return entries.first?.word == word
     }
 
     // MARK: - Vocabulary
@@ -127,18 +172,6 @@ final class DictionaryLookupViewModel {
         return "\(first.word): \(primary.definition)"
     }
 
-    /// Failures where showing an expired cached copy is better than an
-    /// error. `wordNotFound` and selection errors are excluded: the cache
-    /// can't fix a misspelled or unknown word.
-    private func isNetworkFailure(_ error: DictionaryError) -> Bool {
-        switch error {
-        case .noConnection, .network, .serverError, .invalidResponse, .decodingFailed:
-            true
-        case .emptySelection, .invalidSelection, .invalidURL, .wordNotFound:
-            false
-        }
-    }
-
     /// First non-empty definition across all entries and meanings,
     /// paired with the part of speech it belongs to.
     private func primaryDefinition(in entries: [DictionaryEntry]) -> (definition: String, partOfSpeech: String?)? {
@@ -153,4 +186,11 @@ final class DictionaryLookupViewModel {
         }
         return nil
     }
+}
+
+/// Always-empty offline dictionary, used only as a fallback when the
+/// bundled SQLite database can't be opened, so lookups still resolve
+/// (as `.notInDictionary`) instead of crashing or being unavailable.
+private struct EmptyOfflineDictionaryService: OfflineDictionaryServiceProtocol {
+    func lookup(word: String) async -> [DictionaryEntry] { [] }
 }
