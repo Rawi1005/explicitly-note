@@ -56,9 +56,16 @@ Two modes:
           they should be presented in the app — sense_index is assigned
           from that order, grouped per word as encountered.
 
+  --oewn-sqlite PATH
+      Converts an official Open English WordNet SQLite release into the
+      compact `entries` schema used by the app. The source database is
+      attached read-only and is never modified. Definitions, one example,
+      synonyms, and lexical antonyms are retained.
+
 Usage:
     python3 Tools/build_dictionary.py --seed
     python3 Tools/build_dictionary.py --wordnet /path/to/wordnet.json
+    python3 Tools/build_dictionary.py --oewn-sqlite Dictionaries/oewn.sqlite
     python3 Tools/build_dictionary.py --seed --output /tmp/test.sqlite
 """
 
@@ -803,6 +810,163 @@ def ingest_wordnet(conn: sqlite3.Connection, path: Path) -> tuple[int, int]:
     return len(words_seen), len(rows)
 
 
+def ingest_oewn_sqlite(conn: sqlite3.Connection, path: Path) -> tuple[int, int]:
+    """Converts an Open English WordNet SQLite release into `entries`.
+
+    OEWN stores words, senses, synsets, examples, and lexical relations in
+    normalized tables. This conversion flattens those tables once at build
+    time so an on-device lookup remains a single indexed query.
+    """
+    if not path.is_file():
+        raise ValueError(f"Open English WordNet SQLite database not found: {path}")
+
+    conn.execute("ATTACH DATABASE ? AS oewn", (str(path.resolve()),))
+    required_tables = {
+        "lexrelations",
+        "poses",
+        "relations",
+        "samples",
+        "senses",
+        "synsets",
+        "words",
+    }
+    available_tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM oewn.sqlite_master WHERE type = 'table'"
+        )
+    }
+    missing_tables = sorted(required_tables - available_tables)
+    if missing_tables:
+        raise ValueError(
+            "Not a supported Open English WordNet SQLite database; "
+            f"missing tables: {', '.join(missing_tables)}"
+        )
+
+    # Pre-aggregate the one-to-many data before the main INSERT. This keeps
+    # the conversion deterministic and avoids multiplying sense rows when a
+    # synset has several examples, synonyms, or antonyms.
+    conn.executescript(
+        """
+        CREATE TEMP TABLE oewn_examples AS
+        SELECT sample.synsetid, sample.sample
+        FROM oewn.samples AS sample
+        JOIN (
+            SELECT synsetid, MIN(sampleid) AS sampleid
+            FROM oewn.samples
+            GROUP BY synsetid
+        ) AS first_sample
+          ON first_sample.synsetid = sample.synsetid
+         AND first_sample.sampleid = sample.sampleid;
+
+        CREATE UNIQUE INDEX oewn_examples_synset
+            ON oewn_examples(synsetid);
+
+        CREATE TEMP TABLE oewn_synonyms AS
+        WITH unique_synonyms AS (
+            SELECT DISTINCT
+                source_sense.senseid,
+                LOWER(TRIM(synonym_word.word)) AS synonym
+            FROM oewn.senses AS source_sense
+            JOIN oewn.senses AS synonym_sense
+              ON synonym_sense.synsetid = source_sense.synsetid
+             AND synonym_sense.wordid <> source_sense.wordid
+            JOIN oewn.words AS synonym_word
+              ON synonym_word.wordid = synonym_sense.wordid
+            WHERE TRIM(synonym_word.word) <> ''
+        )
+        SELECT senseid, GROUP_CONCAT(synonym, '|') AS synonyms
+        FROM unique_synonyms
+        GROUP BY senseid;
+
+        CREATE UNIQUE INDEX oewn_synonyms_sense
+            ON oewn_synonyms(senseid);
+
+        CREATE TEMP TABLE oewn_antonyms AS
+        WITH unique_antonyms AS (
+            SELECT DISTINCT
+                source_sense.senseid,
+                LOWER(TRIM(antonym_word.word)) AS antonym
+            FROM oewn.senses AS source_sense
+            JOIN oewn.lexrelations AS lexical_relation
+              ON lexical_relation.synset1id = source_sense.synsetid
+             AND lexical_relation.lu1id = source_sense.luid
+             AND lexical_relation.word1id = source_sense.wordid
+            JOIN oewn.relations AS relation
+              ON relation.relationid = lexical_relation.relationid
+             AND relation.relation = 'antonym'
+            JOIN oewn.words AS antonym_word
+              ON antonym_word.wordid = lexical_relation.word2id
+            WHERE TRIM(antonym_word.word) <> ''
+        )
+        SELECT senseid, GROUP_CONCAT(antonym, '|') AS antonyms
+        FROM unique_antonyms
+        GROUP BY senseid;
+
+        CREATE UNIQUE INDEX oewn_antonyms_sense
+            ON oewn_antonyms(senseid);
+        """
+    )
+
+    conn.execute(
+        """
+        INSERT INTO entries (
+            word,
+            part_of_speech,
+            definition,
+            example,
+            synonyms,
+            antonyms,
+            sense_index
+        )
+        SELECT
+            LOWER(TRIM(word.word)),
+            CASE synset.posid
+                WHEN 's' THEN 'adjective'
+                ELSE part_of_speech.pos
+            END,
+            synset.definition,
+            example.sample,
+            synonym.synonyms,
+            antonym.antonyms,
+            ROW_NUMBER() OVER (
+                PARTITION BY LOWER(TRIM(word.word))
+                ORDER BY
+                    CASE synset.posid
+                        WHEN 'n' THEN 0
+                        WHEN 'v' THEN 1
+                        WHEN 'a' THEN 2
+                        WHEN 's' THEN 2
+                        WHEN 'r' THEN 3
+                        ELSE 4
+                    END,
+                    COALESCE(sense.sensenum, 2147483647),
+                    sense.senseid
+            ) - 1
+        FROM oewn.senses AS sense
+        JOIN oewn.words AS word
+          ON word.wordid = sense.wordid
+        JOIN oewn.synsets AS synset
+          ON synset.synsetid = sense.synsetid
+        JOIN oewn.poses AS part_of_speech
+          ON part_of_speech.posid = synset.posid
+        LEFT JOIN oewn_examples AS example
+          ON example.synsetid = sense.synsetid
+        LEFT JOIN oewn_synonyms AS synonym
+          ON synonym.senseid = sense.senseid
+        LEFT JOIN oewn_antonyms AS antonym
+          ON antonym.senseid = sense.senseid
+        WHERE TRIM(word.word) <> ''
+          AND TRIM(synset.definition) <> ''
+        """
+    )
+
+    word_count, row_count = conn.execute(
+        "SELECT COUNT(DISTINCT word), COUNT(*) FROM entries"
+    ).fetchone()
+    return int(word_count), int(row_count)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the SmartNotes offline dictionary.sqlite database.")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -816,6 +980,12 @@ def main() -> None:
         metavar="PATH",
         type=Path,
         help="Build the database by ingesting a WordNet-derived JSON file at PATH (see module docstring for shape).",
+    )
+    mode.add_argument(
+        "--oewn-sqlite",
+        metavar="PATH",
+        type=Path,
+        help="Build the database from an Open English WordNet SQLite release.",
     )
     parser.add_argument(
         "--output",
@@ -837,9 +1007,12 @@ def main() -> None:
         if args.seed:
             word_count, row_count = seed_from_data(conn)
             source = "seed dataset"
-        else:
+        elif args.wordnet:
             word_count, row_count = ingest_wordnet(conn, args.wordnet)
             source = f"WordNet JSON ({args.wordnet})"
+        else:
+            word_count, row_count = ingest_oewn_sqlite(conn, args.oewn_sqlite)
+            source = f"Open English WordNet SQLite ({args.oewn_sqlite})"
         conn.commit()
     finally:
         conn.close()

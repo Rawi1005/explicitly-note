@@ -11,7 +11,7 @@ import SwiftData
 ///    when the network request fails.
 @MainActor
 final class DictionaryCacheService {
-    static let expirationInterval: TimeInterval = 7 * 24 * 60 * 60
+    nonisolated static let expirationInterval: TimeInterval = 7 * 24 * 60 * 60
 
     struct CachedResult {
         let entries: [DictionaryEntry]

@@ -74,6 +74,19 @@ Re-run `xcodegen generate` after pulling changes that add new source files, so
 the `.xcodeproj` picks them up. (You never edit the `.xcodeproj` by hand — change
 `project.yml` instead.)
 
+### Rebuilding the full offline dictionary
+
+Keep the downloaded Open English WordNet SQLite file under `Dictionaries/`,
+then convert it into the compact database bundled by the app:
+
+```sh
+python3 Tools/build_dictionary.py \
+  --oewn-sqlite Dictionaries/oewn-plus-2026-sqlite-3.0.1.sqlite
+```
+
+The source download is left untouched and ignored by Git; the generated app
+database is written to `SmartNotes/Resources/dictionary.sqlite`.
+
 ### Troubleshooting
 
 | Symptom | Fix |

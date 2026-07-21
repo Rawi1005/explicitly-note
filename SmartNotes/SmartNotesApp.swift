@@ -5,9 +5,11 @@ import SwiftData
 struct SmartNotesApp: App {
     var body: some Scene {
         WindowGroup {
-            RootTabView()
+            NotebookLibraryView()
         }
         .modelContainer(for: [
+            Notebook.self,
+            NotebookPage.self,
             Note.self,
             CachedDictionaryEntry.self,
             VocabularyItem.self
@@ -15,22 +17,7 @@ struct SmartNotesApp: App {
     }
 }
 
-struct RootTabView: View {
-    var body: some View {
-        TabView {
-            NotesLibraryView()
-                .tabItem { Label("Notes", systemImage: "note.text") }
-
-            VocabularyListView()
-                .tabItem { Label("Vocabulary", systemImage: "character.book.closed") }
-
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
-        }
-    }
-}
-
 #Preview {
-    RootTabView()
-        .modelContainer(for: [Note.self, CachedDictionaryEntry.self, VocabularyItem.self], inMemory: true)
+    NotebookLibraryView()
+        .modelContainer(for: [Notebook.self, NotebookPage.self], inMemory: true)
 }

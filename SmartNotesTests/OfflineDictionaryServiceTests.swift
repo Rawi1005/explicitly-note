@@ -11,8 +11,8 @@ final class OfflineDictionaryServiceTests: XCTestCase {
     private var databaseURL: URL!
     private var service: SQLiteOfflineDictionaryService!
 
-    override func setUp() throws {
-        try super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         databaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("offline-dictionary-tests-\(UUID().uuidString)")
             .appendingPathExtension("sqlite")
@@ -23,13 +23,13 @@ final class OfflineDictionaryServiceTests: XCTestCase {
         )
     }
 
-    override func tearDown() throws {
+    override func tearDownWithError() throws {
         service = nil
         if let databaseURL, FileManager.default.fileExists(atPath: databaseURL.path) {
             try FileManager.default.removeItem(at: databaseURL)
         }
         databaseURL = nil
-        try super.tearDown()
+        try super.tearDownWithError()
     }
 
     // MARK: - Test database

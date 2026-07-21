@@ -23,3 +23,6 @@ Pods/
 Carthage/Build/
 
 .DS_Store
+
+# Local source downloads used to build the bundled offline dictionary.
+/Dictionaries/*.sqlite

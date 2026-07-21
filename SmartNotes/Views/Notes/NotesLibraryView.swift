@@ -18,6 +18,7 @@ private struct NotesLibraryContent: View {
     @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
     @State private var selectedNote: Note?
     @State private var path: [Note] = []
+    @State private var notePendingDeletion: Note?
 
     init(viewModel: NotesLibraryViewModel) {
         _viewModel = State(initialValue: viewModel)
@@ -98,6 +99,30 @@ private struct NotesLibraryContent: View {
             .toolbar { libraryToolbar }
             .overlay { emptyState }
             .navigationTitle("Notes")
+            .confirmationDialog(
+                "Delete this note?",
+                isPresented: noteDeletionBinding,
+                titleVisibility: .visible
+            ) {
+                Button("Delete Note", role: .destructive) {
+                    if let notePendingDeletion {
+                        delete(notePendingDeletion)
+                    }
+                    notePendingDeletion = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    notePendingDeletion = nil
+                }
+            } message: {
+                Text("The note and its content will be removed. This action cannot be undone.")
+            }
+    }
+
+    private var noteDeletionBinding: Binding<Bool> {
+        Binding(
+            get: { notePendingDeletion != nil },
+            set: { if !$0 { notePendingDeletion = nil } }
+        )
     }
 
     // MARK: - Toolbar and actions
@@ -126,7 +151,7 @@ private struct NotesLibraryContent: View {
 
     private func deleteButton(for note: Note) -> some View {
         Button(role: .destructive) {
-            delete(note)
+            notePendingDeletion = note
         } label: {
             Label("Delete", systemImage: "trash")
         }
