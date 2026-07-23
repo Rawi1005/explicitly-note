@@ -11,6 +11,7 @@ struct AIExplanationSheet: View {
     var onInsert: ((String) -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var level: ExplanationLevel
     @State private var subject: StudySubject
     @State private var isLoading = false
@@ -113,6 +114,7 @@ struct AIExplanationSheet: View {
                             .buttonStyle(.borderedProminent)
                         }
                     }
+                    .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
                 }
 
                 if let errorMessage {
@@ -121,8 +123,12 @@ struct AIExplanationSheet: View {
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
+                    .transition(.opacity)
                 }
             }
+            .animation(stateAnimation, value: isLoading)
+            .animation(stateAnimation, value: explanation)
+            .animation(stateAnimation, value: errorMessage)
             .navigationTitle("Explain with AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -135,19 +141,34 @@ struct AIExplanationSheet: View {
         .presentationDragIndicator(.visible)
     }
 
+    private var stateAnimation: Animation? {
+        reduceMotion ? nil : .easeInOut(duration: 0.2)
+    }
+
     private func explain() async {
-        isLoading = true
-        errorMessage = nil
-        defer { isLoading = false }
+        withAnimation(stateAnimation) {
+            isLoading = true
+            errorMessage = nil
+            // A failed retry must not leave an older answer visible beside
+            // the new error.
+            explanation = nil
+        }
         do {
-            explanation = try await service.explain(
+            let result = try await service.explain(
                 selectedText: selectedText,
                 context: context,
                 level: level,
                 subject: subject
             )
+            withAnimation(stateAnimation) {
+                explanation = result
+                isLoading = false
+            }
         } catch {
-            errorMessage = "The explanation couldn't be generated. Please try again."
+            withAnimation(stateAnimation) {
+                errorMessage = "The explanation couldn't be generated. Please try again."
+                isLoading = false
+            }
         }
     }
 }

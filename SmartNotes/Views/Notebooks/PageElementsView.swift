@@ -8,10 +8,17 @@ import UIKit
 /// (two-finger twist), proportional scaling, duplication, image cropping, and
 /// text styling through the system edit menu.
 @MainActor
-final class PageElementsView: UIView, UIEditMenuInteractionDelegate {
+final class PageElementsView: UIView, @preconcurrency UIEditMenuInteractionDelegate {
     private(set) var elements: [PageElement] = []
     var onElementsChanged: (([PageElement]) -> Void)?
     var imageProvider: ((String) -> UIImage?)?
+    /// Fired whenever the selection changes, so the canvas can hand
+    /// single-finger drags to the selected element instead of scrolling.
+    var onSelectionStateChanged: ((Bool) -> Void)?
+
+    var hasSelection: Bool {
+        selectedElementID != nil
+    }
 
     var isInteractionAllowed = false {
         didSet {
@@ -48,10 +55,14 @@ final class PageElementsView: UIView, UIEditMenuInteractionDelegate {
     // MARK: - Loading & persistence
 
     func load(elements: [PageElement]) {
+        let hadSelection = selectedElementID != nil
         self.elements = elements
         elementViews.values.forEach { $0.removeFromSuperview() }
         elementViews = [:]
         selectedElementID = nil
+        if hadSelection {
+            onSelectionStateChanged?(false)
+        }
         for element in elements {
             attachView(for: element)
         }
@@ -70,9 +81,15 @@ final class PageElementsView: UIView, UIEditMenuInteractionDelegate {
     // MARK: - Adding elements
 
     @discardableResult
-    func addTextElement(at point: CGPoint, fontSize: Double, initialText: String = "") -> PageElement {
+    func addTextElement(
+        at point: CGPoint,
+        fontSize: Double,
+        initialText: String = "",
+        configure: ((inout PageElement) -> Void)? = nil
+    ) -> PageElement {
         var element = PageElement.textElement(at: point, fontSize: fontSize)
         element.text = initialText
+        configure?(&element)
         element.frame.origin.x = min(max(0, element.frame.origin.x), max(bounds.width - element.frame.width, 0))
         element.frame.origin.y = min(max(0, element.frame.origin.y), max(bounds.height - element.frame.height, 0))
         elements.append(element)
@@ -112,11 +129,13 @@ final class PageElementsView: UIView, UIEditMenuInteractionDelegate {
     }
 
     func removeElement(id: UUID) {
+        let removedSelection = selectedElementID == id
         elements.removeAll { $0.id == id }
         elementViews[id]?.removeFromSuperview()
         elementViews[id] = nil
-        if selectedElementID == id {
+        if removedSelection {
             selectedElementID = nil
+            onSelectionStateChanged?(false)
         }
         persist()
     }
@@ -129,6 +148,16 @@ final class PageElementsView: UIView, UIEditMenuInteractionDelegate {
         if id == nil {
             editMenuInteraction?.dismissMenu()
         }
+        onSelectionStateChanged?(id != nil)
+    }
+
+    /// Restyles the currently selected text box (used by the text options bar).
+    func updateSelectedTextElement(_ change: (inout PageElement) -> Void) {
+        guard let selectedElementID,
+              let element = elements.first(where: { $0.id == selectedElementID }),
+              element.kind == .text,
+              let view = elementViews[selectedElementID] else { return }
+        view.modifyElement(change)
     }
 
     func deselect() {
@@ -168,21 +197,30 @@ final class PageElementsView: UIView, UIEditMenuInteractionDelegate {
         persist()
     }
 
-    func duplicateElements(ids: [UUID]) {
+    @discardableResult
+    func duplicateElements(ids: [UUID]) -> [UUID] {
+        var newIDs: [UUID] = []
         for id in ids {
             guard let element = elements.first(where: { $0.id == id }) else { continue }
             let copy = element.duplicated()
             elements.append(copy)
             attachView(for: copy)
+            newIDs.append(copy.id)
         }
         persist()
+        return newIDs
     }
 
     func removeElements(ids: [UUID]) {
+        let removedSelection = selectedElementID.map(ids.contains) ?? false
         for id in ids {
             elements.removeAll { $0.id == id }
             elementViews[id]?.removeFromSuperview()
             elementViews[id] = nil
+        }
+        if removedSelection {
+            selectedElementID = nil
+            onSelectionStateChanged?(false)
         }
         persist()
     }

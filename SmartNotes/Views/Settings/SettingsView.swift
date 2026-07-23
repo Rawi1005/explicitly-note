@@ -41,7 +41,14 @@ struct SettingsView: View {
 
     private var dictionarySection: some View {
         Section {
-            LabeledContent("Cached words", value: "\(cacheCount)")
+            LabeledContent {
+                Text("\(cacheCount)")
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .animation(.snappy(duration: 0.22), value: cacheCount)
+            } label: {
+                Text("Cached words")
+            }
             Button("Clear Dictionary Cache", role: .destructive) {
                 showingClearConfirmation = true
             }

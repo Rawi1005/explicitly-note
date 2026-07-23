@@ -40,20 +40,29 @@ struct NotebookLibraryView: View {
     @State private var pendingImportURLs: [URL] = []
     @State private var isReadyForImports = false
     @State private var errorMessage: String?
+    @Namespace private var zoomNamespace
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
-            LibraryFolderScreen(folderID: nil, folderTitle: "Notebooks", path: $navigationPath)
-                .navigationDestination(for: LibraryRoute.self) { route in
-                    Group {
-                        switch route {
-                        case .folder(let folderID):
-                            LibraryFolderScreen(
-                                folderID: folderID,
-                                folderTitle: nil,
-                                path: $navigationPath
-                            )
-                        case .notebook(let notebookID):
+            LibraryFolderScreen(
+                folderID: nil,
+                folderTitle: "Notebooks",
+                path: $navigationPath,
+                zoomNamespace: zoomNamespace
+            )
+            .navigationDestination(for: LibraryRoute.self) { route in
+                Group {
+                    switch route {
+                    case .folder(let folderID):
+                        LibraryFolderScreen(
+                            folderID: folderID,
+                            folderTitle: nil,
+                            path: $navigationPath,
+                            zoomNamespace: zoomNamespace
+                        )
+                        .zoomNavigationDestination(id: LibraryRoute.folder(folderID), in: zoomNamespace)
+                    case .notebook(let notebookID):
+                        Group {
                             if let notebook = notebooks.first(where: { $0.id == notebookID }) {
                                 NotebookEditorView(notebook: notebook)
                             } else {
@@ -64,10 +73,11 @@ struct NotebookLibraryView: View {
                             }
                         }
                     }
-                    // The tab bar belongs to the main menu only; pushed
-                    // screens use the full height for content.
-                    .toolbar(.hidden, for: .tabBar)
                 }
+                // The tab bar belongs to the main menu only; pushed
+                // screens use the full height for content.
+                .toolbar(.hidden, for: .tabBar)
+            }
         }
         .onOpenURL { url in
             // On a cold launch this fires before the scene is active; queue the
@@ -82,6 +92,15 @@ struct NotebookLibraryView: View {
         }
         .task {
             isReadyForImports = true
+            // Cold launch: resume in the notebook that was open when the app
+            // was last closed, instead of starting back at the library.
+            if navigationPath.isEmpty,
+               pendingImportURLs.isEmpty,
+               let saved = UserDefaults.standard.string(forKey: "gloss.session.notebookID"),
+               let savedID = UUID(uuidString: saved),
+               notebooks.contains(where: { $0.id == savedID }) {
+                navigationPath = [.notebook(savedID)]
+            }
             processPendingImports()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -126,6 +145,7 @@ private struct LibraryFolderScreen: View {
     let folderID: UUID?
     let folderTitle: String?
     @Binding var path: [LibraryRoute]
+    let zoomNamespace: Namespace.ID
 
     @Environment(\.modelContext) private var modelContext
     @Query private var allNotebooks: [Notebook]
@@ -338,6 +358,7 @@ private struct LibraryFolderScreen: View {
             )
         }
         .buttonStyle(PressableCardButtonStyle())
+        .zoomTransitionSource(id: LibraryRoute.folder(folder.id), in: zoomNamespace)
         .onDrag {
             NSItemProvider(object: dragPayload(startingWithFolder: folder.id) as NSString)
         }
@@ -861,6 +882,7 @@ private struct FolderCardView: View {
             .overlay(alignment: .topTrailing) {
                 if isSelecting {
                     SelectionBadge(isSelected: isSelected)
+                        .transition(.scale(scale: 0.8).combined(with: .opacity))
                 }
             }
 
@@ -874,6 +896,8 @@ private struct FolderCardView: View {
                 .foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
+        .animation(.snappy(duration: 0.2), value: isSelecting)
+        .animation(.snappy(duration: 0.18), value: isSelected)
     }
 }
 
@@ -891,6 +915,7 @@ private struct NotebookCardView: View {
                 .overlay(alignment: .topTrailing) {
                     if isSelecting {
                         SelectionBadge(isSelected: isSelected)
+                            .transition(.scale(scale: 0.8).combined(with: .opacity))
                     }
                 }
 
@@ -915,6 +940,8 @@ private struct NotebookCardView: View {
             .foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
+        .animation(.snappy(duration: 0.2), value: isSelecting)
+        .animation(.snappy(duration: 0.18), value: isSelected)
     }
 }
 
@@ -944,6 +971,7 @@ private struct NotebookCoverView: View {
                 Image(uiImage: thumbnail)
                     .resizable()
                     .scaledToFit()
+                    .transition(.opacity)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: pdfData == nil ? "doc" : "doc.richtext")
@@ -954,14 +982,25 @@ private struct NotebookCoverView: View {
                 .foregroundStyle(.tertiary)
             }
         }
+        .animation(.easeOut(duration: 0.18), value: thumbnail != nil)
         .task(id: pdfData?.count) {
-            guard let pdfData,
-                  let document = PDFDocument(data: pdfData),
-                  let page = document.page(at: 0) else {
+            guard let pdfData else {
                 thumbnail = nil
                 return
             }
-            thumbnail = page.thumbnail(of: CGSize(width: 360, height: 480), for: .mediaBox)
+            // PDF thumbnailing is synchronous and expensive. Running it on the
+            // main actor can stall the card-tap navigation animation and make
+            // the editor toolbar appear to flash on the way in.
+            let image = await Task.detached(priority: .utility) {
+                guard let document = PDFDocument(data: pdfData),
+                      let page = document.page(at: 0) else { return nil as UIImage? }
+                return page.thumbnail(
+                    of: CGSize(width: 360, height: 480),
+                    for: .mediaBox
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            thumbnail = image
         }
     }
 }

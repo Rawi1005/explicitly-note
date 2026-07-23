@@ -60,7 +60,7 @@ struct VocabularyListView: View {
                 if items.isEmpty {
                     emptyState
                 } else if filteredItems.isEmpty {
-                    ContentUnavailableView.search(text: viewModel.searchText)
+                    filteredEmptyState
                 } else {
                     list
                 }
@@ -88,8 +88,10 @@ struct VocabularyListView: View {
                 Button("Cancel", role: .cancel) { itemPendingDeletion = nil }
                 Button("Delete", role: .destructive) {
                     if let item = itemPendingDeletion {
-                        modelContext.delete(item)
-                        try? modelContext.save()
+                        withAnimation(.snappy(duration: 0.22)) {
+                            modelContext.delete(item)
+                            try? modelContext.save()
+                        }
                     }
                     itemPendingDeletion = nil
                 }
@@ -136,6 +138,19 @@ struct VocabularyListView: View {
             Label("No Saved Words", systemImage: "character.book.closed")
         } description: {
             Text("Tap a word in a PDF notebook or select text in a note, then choose \u{201C}Add to Vocab\u{201D} to build your word list.")
+        }
+    }
+
+    @ViewBuilder
+    private var filteredEmptyState: some View {
+        if !viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ContentUnavailableView.search(text: viewModel.searchText)
+        } else {
+            ContentUnavailableView(
+                listFilter?.isEmpty == true ? "No Unfiled Words" : "No Words in This List",
+                systemImage: "tray",
+                description: Text("Choose another list or move a saved word here.")
+            )
         }
     }
 

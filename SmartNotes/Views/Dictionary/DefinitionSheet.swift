@@ -26,6 +26,7 @@ struct DefinitionSheet: View {
 
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var viewModel = DictionaryLookupViewModel()
     @State private var showingAIExplanation = false
     @AppStorage("smartnotes.underline.colorHex") private var underlineColorHex = "#0A84FF"
@@ -43,6 +44,9 @@ struct DefinitionSheet: View {
                 notInDictionaryView(word: word)
             }
         }
+        .id(presentedState)
+        .transition(.opacity)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: presentedState)
         .overlay(alignment: .topTrailing) {
             Button {
                 dismiss()
@@ -70,6 +74,22 @@ struct DefinitionSheet: View {
                 context: request.context,
                 onInsert: onInsertDefinition
             )
+        }
+    }
+
+    private enum PresentedState: Hashable {
+        case loading
+        case failed
+        case dictionary
+        case notInDictionary
+    }
+
+    private var presentedState: PresentedState {
+        switch viewModel.state {
+        case .idle, .loading: .loading
+        case .failed: .failed
+        case .dictionary: .dictionary
+        case .notInDictionary: .notInDictionary
         }
     }
 

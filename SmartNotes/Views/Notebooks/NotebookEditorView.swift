@@ -53,6 +53,7 @@ private struct TranslationSheetModifier: ViewModifier {
 
 struct NotebookEditorView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Bindable var notebook: Notebook
     @Query private var pages: [NotebookPage]
 
@@ -61,9 +62,7 @@ struct NotebookEditorView: View {
     @State private var pdfDocument: PDFDocument?
     @State private var selectedPageID: UUID?
     @State private var showsPageRail = false
-    @State private var inkPaletteExpanded = true
-    @State private var toolHelpVisible = true
-    @State private var toolHelpDismissTask: Task<Void, Never>?
+    @State private var inkPaletteExpanded = false
     @State private var pagePendingDeletion: NotebookPage?
     @State private var showingClearConfirmation = false
     @State private var sharedDocument: SharedDocument?
@@ -103,6 +102,10 @@ struct NotebookEditorView: View {
         pages.sorted { $0.orderIndex < $1.orderIndex }
     }
 
+    private var lastPageDefaultsKey: String {
+        "gloss.lastPage.\(notebook.id.uuidString)"
+    }
+
     private var selectedPage: NotebookPage? {
         if let selectedPageID,
            let selected = orderedPages.first(where: { $0.id == selectedPageID }) {
@@ -140,12 +143,29 @@ struct NotebookEditorView: View {
         }
         .animation(.snappy(duration: 0.3), value: toastMessage)
         .onAppear {
+            // Remember that this notebook is open so a relaunch resumes here.
+            UserDefaults.standard.set(
+                notebook.id.uuidString,
+                forKey: "gloss.session.notebookID"
+            )
             // A vocabulary entry can ask to open this notebook at its page.
             if let jumpPageID = AppNavigator.shared.consumePendingPage(for: notebook.id) {
                 selectedPageID = jumpPageID
             }
+            // Otherwise resume at the page the user last had open.
+            if selectedPageID == nil,
+               let saved = UserDefaults.standard.string(forKey: lastPageDefaultsKey),
+               let savedID = UUID(uuidString: saved),
+               orderedPages.contains(where: { $0.id == savedID }) {
+                selectedPageID = savedID
+            }
             if selectedPageID == nil {
                 selectedPageID = orderedPages.first?.id
+            }
+        }
+        .onChange(of: selectedPageID) { _, pageID in
+            if let pageID {
+                UserDefaults.standard.set(pageID.uuidString, forKey: lastPageDefaultsKey)
             }
         }
         .onChange(of: orderedPages.map(\.id)) { _, pageIDs in
@@ -166,6 +186,9 @@ struct NotebookEditorView: View {
             scheduleSearch()
         }
         .onDisappear {
+            // Reached only by navigating back — an app kill skips this, so a
+            // relaunch knows to reopen the notebook.
+            UserDefaults.standard.removeObject(forKey: "gloss.session.notebookID")
             saveTask?.cancel()
             searchTask?.cancel()
             try? modelContext.save()
@@ -280,7 +303,10 @@ struct NotebookEditorView: View {
                 pdfDocument: pdfDocument,
                 selectedPageID: $selectedPageID,
                 controller: drawingController,
-                topOverlayInset: 104,
+                // Keep this constant while contextual controls open and close.
+                // Changing the scroll inset during a PDF tile render is a
+                // common source of the document-entry flash.
+                topOverlayInset: 116,
                 searchHighlights: searchHighlights,
                 annotations: pageAnnotations,
                 onDrawingChanged: saveDrawing,
@@ -312,56 +338,60 @@ struct NotebookEditorView: View {
     // MARK: - Floating palettes
 
     private var floatingPalettes: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             if showingSearch {
                 searchBar
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
             }
 
-            ViewThatFits(in: .horizontal) {
-                paletteContent
+            if horizontalSizeClass == .compact {
                 ScrollView(.horizontal, showsIndicators: false) {
                     paletteContent
                         .padding(.horizontal, 4)
+                        .immediateScrollTouches()
                 }
+                .scrollBounceBehavior(.basedOnSize)
+            } else {
+                paletteContent
             }
 
-            if drawingController.selectedTool.acceptsInkOptions && inkPaletteExpanded {
-                inkPalette
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            } else if !toolHelpText.isEmpty && toolHelpVisible {
-                Text(toolHelpText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .liquidGlass(in: Capsule())
-                    .transition(.opacity)
+            if inkPaletteExpanded {
+                contextualToolOptions
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
             }
         }
         .padding(.top, 8)
         .padding(.horizontal, 12)
         .frame(maxWidth: .infinity)
-        .animation(.snappy(duration: 0.25), value: drawingController.selectedTool)
-        .animation(.snappy(duration: 0.25), value: inkPaletteExpanded)
-        .animation(.snappy(duration: 0.25), value: showingSearch)
-        .animation(.easeOut(duration: 0.4), value: toolHelpVisible)
-        .onChange(of: drawingController.selectedTool) { _, _ in
-            showToolHelpBriefly()
-        }
-        .onAppear {
-            showToolHelpBriefly()
-        }
+        .animation(.snappy(duration: 0.22), value: drawingController.selectedTool)
+        .animation(.snappy(duration: 0.22), value: inkPaletteExpanded)
+        .animation(.snappy(duration: 0.22), value: showingSearch)
     }
 
-    /// The tool hint fades away on its own after a few seconds.
-    private func showToolHelpBriefly() {
-        toolHelpDismissTask?.cancel()
-        toolHelpVisible = true
-        toolHelpDismissTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
-            toolHelpVisible = false
+    @ViewBuilder
+    private var contextualToolOptions: some View {
+        if drawingController.selectedTool == .text {
+            if horizontalSizeClass == .compact {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    textOptionsBar
+                        .padding(.horizontal, 4)
+                        .immediateScrollTouches()
+                }
+                .scrollBounceBehavior(.basedOnSize)
+            } else {
+                textOptionsBar
+            }
+        } else if drawingController.selectedTool.acceptsInkOptions {
+            if horizontalSizeClass == .compact {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    inkPalette
+                        .padding(.horizontal, 4)
+                        .immediateScrollTouches()
+                }
+                .scrollBounceBehavior(.basedOnSize)
+            } else {
+                inkPalette
+            }
         }
     }
 
@@ -422,94 +452,146 @@ struct NotebookEditorView: View {
     }
 
     private var paletteContent: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 2) {
-                ForEach(NotebookDrawingTool.allCases) { tool in
-                    toolButton(tool)
-                }
+        HStack(spacing: 3) {
+            ForEach(NotebookDrawingTool.allCases) { tool in
+                toolButton(tool)
             }
-            .padding(4)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
 
-            HStack(spacing: 2) {
-                historyButton(
-                    "arrow.uturn.backward",
-                    label: "Undo",
-                    enabled: drawingController.canUndo,
-                    action: drawingController.undo
-                )
-                historyButton(
-                    "arrow.uturn.forward",
-                    label: "Redo",
-                    enabled: drawingController.canRedo,
-                    action: drawingController.redo
-                )
+            toolbarDivider
 
-                Button {
-                    withAnimation(.snappy(duration: 0.2)) {
-                        drawingController.toggleRuler()
-                    }
-                } label: {
-                    Image(systemName: "ruler")
-                        .font(.system(size: 17, weight: .medium))
-                        .frame(width: 44, height: 40)
-                        .foregroundStyle(drawingController.isRulerActive ? Color.accentColor : .primary)
-                        .background {
-                            if drawingController.isRulerActive {
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(Color.accentColor.opacity(0.16))
-                            }
+            Button {
+                toggleToolOptions()
+            } label: {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 44, height: 42)
+                    .foregroundStyle(inkPaletteExpanded ? Color.accentColor : .primary)
+                    .background {
+                        if inkPaletteExpanded {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.14))
                         }
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Ruler")
-
-                Button {
-                    showingPhotoPicker = true
-                } label: {
-                    Image(systemName: "photo")
-                        .font(.system(size: 17, weight: .medium))
-                        .frame(width: 44, height: 40)
-                        .foregroundStyle(.primary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Insert Photo")
+                    }
             }
-            .padding(4)
-            .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .buttonStyle(.plain)
+            .disabled(!selectedToolHasOptions)
+            .opacity(selectedToolHasOptions ? 1 : 0.35)
+            .contentShape(Rectangle())
+            .accessibilityLabel(inkPaletteExpanded ? "Hide Tool Options" : "Show Tool Options")
+            .accessibilityHint("Shows color, thickness, or text controls for the selected tool")
+
+            Button {
+                withAnimation(.snappy(duration: 0.2)) {
+                    drawingController.toggleRuler()
+                }
+            } label: {
+                Image(systemName: "ruler")
+                    .font(.system(size: 17, weight: .medium))
+                    .frame(width: 44, height: 42)
+                    .foregroundStyle(drawingController.isRulerActive ? Color.accentColor : .primary)
+                    .background {
+                        if drawingController.isRulerActive {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.14))
+                        }
+                    }
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityLabel("Ruler")
+            .accessibilityValue(drawingController.isRulerActive ? "On" : "Off")
+
+            Button {
+                showingPhotoPicker = true
+            } label: {
+                Image(systemName: "photo")
+                    .font(.system(size: 17, weight: .medium))
+                    .frame(width: 44, height: 42)
+                    .foregroundStyle(.primary)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityLabel("Insert Photo")
+
+            toolbarDivider
+
+            historyButton(
+                "arrow.uturn.backward",
+                label: "Undo",
+                enabled: drawingController.canUndo,
+                action: drawingController.undo
+            )
+            historyButton(
+                "arrow.uturn.forward",
+                label: "Redo",
+                enabled: drawingController.canRedo,
+                action: drawingController.redo
+            )
         }
+        .padding(5)
+        .fixedSize(horizontal: true, vertical: false)
+        .liquidGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var toolbarDivider: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.12))
+            .frame(width: 1, height: 24)
+            .padding(.horizontal, 2)
     }
 
     private func toolButton(_ tool: NotebookDrawingTool) -> some View {
         let isSelected = drawingController.selectedTool == tool
         return Button {
             withAnimation(.snappy(duration: 0.25)) {
-                if isSelected, tool.acceptsInkOptions {
-                    // Tapping the active ink tool again collapses/expands
-                    // its color and width options.
+                if isSelected, toolHasOptions(tool) {
+                    // Like Goodnotes, a second tap on the active tool opens its
+                    // settings. The dedicated sliders button provides the same
+                    // action without requiring users to discover this shortcut.
                     inkPaletteExpanded.toggle()
                 } else {
                     drawingController.selectedTool = tool
-                    if tool.acceptsInkOptions {
-                        inkPaletteExpanded = true
-                    }
+                    inkPaletteExpanded = toolHasOptions(tool)
                 }
             }
+            UISelectionFeedbackGenerator().selectionChanged()
         } label: {
-            Image(systemName: tool.systemImage)
-                .font(.system(size: 17, weight: .medium))
-                .frame(width: 44, height: 40)
-                .foregroundStyle(isSelected ? .white : .primary)
-                .background {
-                    if isSelected {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.accentColor.gradient)
-                            .matchedGeometryEffect(id: "tool-selection", in: toolSelectionNamespace)
+            ZStack(alignment: .bottom) {
+                Image(systemName: tool.systemImage)
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 46, height: 42)
+                    .foregroundStyle(isSelected ? .white : .primary)
+                    .background {
+                        if isSelected {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .fill(Color.accentColor.gradient)
+                                .matchedGeometryEffect(id: "tool-selection", in: toolSelectionNamespace)
+                        }
                     }
+
+                if tool.acceptsInkOptions {
+                    Capsule()
+                        .fill(
+                            Color(
+                                uiColor: UIColor(
+                                    hexString: tool == .highlighter
+                                        ? drawingController.highlighterColorHex
+                                        : drawingController.penColorHex
+                                )
+                            )
+                        )
+                        .frame(width: 16, height: 3)
+                        .overlay {
+                            Capsule().stroke(.white.opacity(isSelected ? 0.9 : 0), lineWidth: 0.5)
+                        }
+                        .padding(.bottom, 3)
                 }
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(tool.label)
+        .accessibilityHint(toolHelpText(for: tool))
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
@@ -527,16 +609,24 @@ struct NotebookEditorView: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
+        .contentShape(Rectangle())
         .accessibilityLabel(label)
     }
 
     private var inkPalette: some View {
         HStack(spacing: 12) {
-            ForEach(presetColors, id: \.accessibilityName) { preset in
-                presetColorButton(preset)
+            ForEach(activeColorPresets, id: \.hex) { preset in
+                inkColorSwatch(name: preset.name, hex: preset.hex)
             }
 
-            ColorPicker("Custom ink color", selection: inkColorBinding, supportsOpacity: false)
+            // Up to two saved custom colors, then the picker to set them.
+            if let custom1 = drawingController.customColor1Hex {
+                inkColorSwatch(name: "Custom color 1", hex: custom1)
+            }
+            if let custom2 = drawingController.customColor2Hex {
+                inkColorSwatch(name: "Custom color 2", hex: custom2)
+            }
+            ColorPicker("Custom ink color", selection: customColorBinding, supportsOpacity: false)
                 .labelsHidden()
                 .padding(.trailing, 6)
 
@@ -556,15 +646,29 @@ struct NotebookEditorView: View {
         .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    private func presetColorButton(_ preset: (accessibilityName: String, color: UIColor)) -> some View {
-        let isSelected = drawingController.inkColor.hexString == preset.color.hexString
+    /// Pen/pencil and highlighter each have their own presets and remembered color.
+    private var activeColorPresets: [(name: String, hex: String)] {
+        if drawingController.selectedTool == .highlighter {
+            return [
+                ("Yellow", "#FFCC00"), ("Green", "#34C759"), ("Pink", "#FF2D55"),
+                ("Blue", "#0A84FF"), ("Orange", "#FF9500")
+            ]
+        }
+        return [
+            ("Black", "#000000"), ("Blue", "#0A84FF"), ("Red", "#FF3B30"),
+            ("Green", "#34C759"), ("Yellow", "#FFCC00")
+        ]
+    }
+
+    private func inkColorSwatch(name: String, hex: String) -> some View {
+        let isSelected = drawingController.activeColorHex.uppercased() == hex.uppercased()
         return Button {
             withAnimation(.snappy(duration: 0.2)) {
-                drawingController.inkColor = preset.color
+                drawingController.setActiveColor(hex: hex)
             }
         } label: {
             Circle()
-                .fill(Color(uiColor: preset.color))
+                .fill(Color(uiColor: UIColor(hexString: hex)))
                 .frame(width: 24, height: 24)
                 .scaleEffect(isSelected ? 1.12 : 1)
                 .overlay {
@@ -576,12 +680,189 @@ struct NotebookEditorView: View {
                 }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(preset.accessibilityName)
+        .accessibilityLabel(name)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
-    private var toolHelpText: String {
-        switch drawingController.selectedTool {
+    // MARK: - Text options
+
+    private var textOptionsBar: some View {
+        HStack(spacing: 12) {
+            Menu {
+                ForEach(fontDesignOptions, id: \.key) { option in
+                    Button {
+                        drawingController.textFontDesign = option.key
+                        drawingController.applyTextStyle { $0.fontDesign = option.key }
+                    } label: {
+                        if drawingController.textFontDesign == option.key {
+                            Label(option.label, systemImage: "checkmark")
+                        } else {
+                            Text(option.label)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(currentFontDesignLabel)
+                        .font(.subheadline)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                }
+                .foregroundStyle(.primary)
+            }
+
+            HStack(spacing: 4) {
+                textBarButton("minus", label: "Smaller Text") {
+                    setTextFontSize(drawingController.textFontSize - 2)
+                }
+                Text("\(Int(drawingController.textFontSize))")
+                    .font(.subheadline.monospacedDigit())
+                    .frame(minWidth: 26)
+                textBarButton("plus", label: "Larger Text") {
+                    setTextFontSize(drawingController.textFontSize + 2)
+                }
+            }
+
+            textBarToggle("bold", label: "Bold", isOn: drawingController.textIsBold) {
+                drawingController.textIsBold.toggle()
+                let value = drawingController.textIsBold
+                drawingController.applyTextStyle { $0.isBold = value }
+            }
+            textBarToggle("italic", label: "Italic", isOn: drawingController.textIsItalic) {
+                drawingController.textIsItalic.toggle()
+                let value = drawingController.textIsItalic
+                drawingController.applyTextStyle { $0.isItalic = value }
+            }
+
+            HStack(spacing: 2) {
+                ForEach(alignmentOptions, id: \.key) { option in
+                    textBarToggle(
+                        option.icon,
+                        label: option.label,
+                        isOn: drawingController.textAlignment == option.key
+                    ) {
+                        drawingController.textAlignment = option.key
+                        drawingController.applyTextStyle { $0.alignment = option.key }
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                ForEach(textColorOptions, id: \.hex) { option in
+                    textColorSwatch(name: option.name, hex: option.hex)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var fontDesignOptions: [(key: String, label: String)] {
+        [("system", "System"), ("serif", "Serif"), ("rounded", "Rounded"), ("mono", "Mono")]
+    }
+
+    private var alignmentOptions: [(key: String, icon: String, label: String)] {
+        [
+            ("left", "text.alignleft", "Align Left"),
+            ("center", "text.aligncenter", "Align Center"),
+            ("right", "text.alignright", "Align Right")
+        ]
+    }
+
+    private var textColorOptions: [(name: String, hex: String)] {
+        [
+            ("Black", "#000000"), ("Blue", "#0A84FF"), ("Red", "#FF3B30"),
+            ("Green", "#34C759"), ("Orange", "#FF9500")
+        ]
+    }
+
+    private var currentFontDesignLabel: String {
+        fontDesignOptions.first { $0.key == drawingController.textFontDesign }?.label ?? "System"
+    }
+
+    private func setTextFontSize(_ size: Double) {
+        let clamped = min(max(size, 8), 120)
+        drawingController.textFontSize = clamped
+        drawingController.applyTextStyle { $0.fontSize = clamped }
+    }
+
+    private func textBarButton(
+        _ systemImage: String,
+        label: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .medium))
+                .frame(width: 30, height: 30)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private func textBarToggle(
+        _ systemImage: String,
+        label: String,
+        isOn: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .medium))
+                .frame(width: 30, height: 30)
+                .foregroundStyle(isOn ? Color.accentColor : .primary)
+                .background {
+                    if isOn {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.16))
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+
+    private func textColorSwatch(name: String, hex: String) -> some View {
+        let isSelected = drawingController.textColorHex.uppercased() == hex.uppercased()
+        return Button {
+            drawingController.textColorHex = hex
+            drawingController.applyTextStyle { $0.colorHex = hex }
+        } label: {
+            Circle()
+                .fill(Color(uiColor: UIColor(hexString: hex)))
+                .frame(width: 20, height: 20)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            isSelected ? Color.accentColor : Color.primary.opacity(0.18),
+                            lineWidth: isSelected ? 2.5 : 1
+                        )
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(name)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var selectedToolHasOptions: Bool {
+        toolHasOptions(drawingController.selectedTool)
+    }
+
+    private func toolHasOptions(_ tool: NotebookDrawingTool) -> Bool {
+        tool.acceptsInkOptions || tool == .text
+    }
+
+    private func toggleToolOptions() {
+        guard selectedToolHasOptions else { return }
+        withAnimation(.snappy(duration: 0.22)) {
+            inkPaletteExpanded.toggle()
+        }
+    }
+
+    private func toolHelpText(for tool: NotebookDrawingTool) -> String {
+        switch tool {
         case .hand:
             pdfDocument == nil
                 ? "Drag to scroll and pinch to zoom."
@@ -593,10 +874,12 @@ struct NotebookEditorView: View {
         }
     }
 
-    private var inkColorBinding: Binding<Color> {
+    /// Picking here saves the color into one of the two custom swatch slots
+    /// and makes it the active ink color.
+    private var customColorBinding: Binding<Color> {
         Binding(
-            get: { Color(uiColor: drawingController.inkColor) },
-            set: { drawingController.inkColor = UIColor($0) }
+            get: { Color(uiColor: UIColor(hexString: drawingController.activeColorHex)) },
+            set: { drawingController.previewCustomColor(hex: UIColor($0).hexString) }
         )
     }
 
@@ -605,16 +888,6 @@ struct NotebookEditorView: View {
             get: { drawingController.activeWidth },
             set: drawingController.setActiveWidth
         )
-    }
-
-    private var presetColors: [(accessibilityName: String, color: UIColor)] {
-        [
-            ("Black", .black),
-            ("Blue", .systemBlue),
-            ("Red", .systemRed),
-            ("Green", .systemGreen),
-            ("Yellow", .systemYellow)
-        ]
     }
 
     // MARK: - Search

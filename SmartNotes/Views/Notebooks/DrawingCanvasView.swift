@@ -66,8 +66,17 @@ final class DrawingCanvasController: ObservableObject {
         static let penWidth = "smartnotes.drawing.penWidth"
         static let pencilWidth = "smartnotes.drawing.pencilWidth"
         static let highlighterWidth = "smartnotes.drawing.highlighterWidth"
-        static let inkColor = "smartnotes.drawing.inkColorHex"
+        static let penColor = "smartnotes.drawing.penColorHex"
+        static let highlighterColor = "smartnotes.drawing.highlighterColorHex"
+        static let customColor1 = "smartnotes.drawing.customColor1Hex"
+        static let customColor2 = "smartnotes.drawing.customColor2Hex"
+        static let customColorNextSlot = "smartnotes.drawing.customColorNextSlot"
         static let textFontSize = "smartnotes.drawing.textFontSize"
+        static let textColor = "smartnotes.drawing.textColorHex"
+        static let textAlignment = "smartnotes.drawing.textAlignment"
+        static let textBold = "smartnotes.drawing.textBold"
+        static let textItalic = "smartnotes.drawing.textItalic"
+        static let textDesign = "smartnotes.drawing.textDesign"
         static let fingerDrawing = "smartnotes.drawing.fingerDrawingEnabled"
         static let pencilDetected = "smartnotes.drawing.pencilDetected"
     }
@@ -80,11 +89,25 @@ final class DrawingCanvasController: ObservableObject {
             applyToolConfiguration()
         }
     }
-    @Published var inkColor: UIColor {
+    /// Pen & pencil ink color — separate from the highlighter's.
+    @Published var penColorHex: String {
         didSet {
-            UserDefaults.standard.set(inkColor.hexString, forKey: DefaultsKey.inkColor)
+            UserDefaults.standard.set(penColorHex, forKey: DefaultsKey.penColor)
             applyToolConfiguration()
         }
+    }
+    @Published var highlighterColorHex: String {
+        didSet {
+            UserDefaults.standard.set(highlighterColorHex, forKey: DefaultsKey.highlighterColor)
+            applyToolConfiguration()
+        }
+    }
+    /// Up to two user-defined custom colors, kept as reusable swatches.
+    @Published var customColor1Hex: String? {
+        didSet { UserDefaults.standard.set(customColor1Hex, forKey: DefaultsKey.customColor1) }
+    }
+    @Published var customColor2Hex: String? {
+        didSet { UserDefaults.standard.set(customColor2Hex, forKey: DefaultsKey.customColor2) }
     }
     @Published var penWidth: Double {
         didSet {
@@ -106,6 +129,29 @@ final class DrawingCanvasController: ObservableObject {
     }
     @Published var textFontSize: Double {
         didSet { UserDefaults.standard.set(textFontSize, forKey: DefaultsKey.textFontSize) }
+    }
+    @Published var textColorHex: String {
+        didSet { UserDefaults.standard.set(textColorHex, forKey: DefaultsKey.textColor) }
+    }
+    @Published var textAlignment: String {
+        didSet { UserDefaults.standard.set(textAlignment, forKey: DefaultsKey.textAlignment) }
+    }
+    @Published var textIsBold: Bool {
+        didSet { UserDefaults.standard.set(textIsBold, forKey: DefaultsKey.textBold) }
+    }
+    @Published var textIsItalic: Bool {
+        didSet { UserDefaults.standard.set(textIsItalic, forKey: DefaultsKey.textItalic) }
+    }
+    @Published var textFontDesign: String {
+        didSet { UserDefaults.standard.set(textFontDesign, forKey: DefaultsKey.textDesign) }
+    }
+    /// True while a text/photo element is selected; one finger then drags the
+    /// element and two fingers scroll, making dragging much easier.
+    var elementSelectionActive = false {
+        didSet {
+            guard oldValue != elementSelectionActive else { return }
+            applyToolConfiguration()
+        }
     }
     /// When false (auto-set once an Apple Pencil is detected), fingers pan and
     /// only the Pencil draws.
@@ -129,7 +175,15 @@ final class DrawingCanvasController: ObservableObject {
         pencilWidth = defaults.object(forKey: DefaultsKey.pencilWidth) as? Double ?? 3
         highlighterWidth = defaults.object(forKey: DefaultsKey.highlighterWidth) as? Double ?? 18
         textFontSize = defaults.object(forKey: DefaultsKey.textFontSize) as? Double ?? 18
-        inkColor = (defaults.string(forKey: DefaultsKey.inkColor)).map(UIColor.init(hexString:)) ?? .black
+        penColorHex = defaults.string(forKey: DefaultsKey.penColor) ?? "#000000"
+        highlighterColorHex = defaults.string(forKey: DefaultsKey.highlighterColor) ?? "#FFCC00"
+        customColor1Hex = defaults.string(forKey: DefaultsKey.customColor1)
+        customColor2Hex = defaults.string(forKey: DefaultsKey.customColor2)
+        textColorHex = defaults.string(forKey: DefaultsKey.textColor) ?? "#000000"
+        textAlignment = defaults.string(forKey: DefaultsKey.textAlignment) ?? "left"
+        textIsBold = defaults.bool(forKey: DefaultsKey.textBold)
+        textIsItalic = defaults.bool(forKey: DefaultsKey.textItalic)
+        textFontDesign = defaults.string(forKey: DefaultsKey.textDesign) ?? "system"
         pencilDetected = defaults.bool(forKey: DefaultsKey.pencilDetected)
         if defaults.object(forKey: DefaultsKey.fingerDrawing) == nil {
             // Before a Pencil is ever seen, fingers draw; afterwards they pan.
@@ -161,26 +215,74 @@ final class DrawingCanvasController: ObservableObject {
 
     func attach(host: MultiPageScrollView) {
         self.host = host
+        // Page rebuilds drop element selections; resync so one-finger
+        // scrolling isn't left disabled by a stale flag.
+        elementSelectionActive = host.pageViews.contains { $0.elementsView.hasSelection }
         applyToolConfiguration()
         refreshHistoryState()
     }
 
+    /// The color for whichever ink tool is active. Pen/pencil and highlighter
+    /// each keep their own color.
+    var activeColorHex: String {
+        selectedTool == .highlighter ? highlighterColorHex : penColorHex
+    }
+
+    func setActiveColor(hex: String) {
+        if selectedTool == .highlighter {
+            highlighterColorHex = hex
+        } else {
+            penColorHex = hex
+        }
+    }
+
+    private var customColorCommitTask: Task<Void, Never>?
+
+    /// Live-updates the active ink color while the color picker is being dragged,
+    /// but defers saving it into a swatch slot until the user settles. The
+    /// picker's binding fires continuously as you drag, so committing on every
+    /// value would burn through both custom slots on a single pick — the bug
+    /// where "selecting one color selects two".
+    func previewCustomColor(hex: String) {
+        setActiveColor(hex: hex)
+        customColorCommitTask?.cancel()
+        customColorCommitTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.storeCustomColor(hex: hex)
+        }
+    }
+
+    /// Stores a picked custom color into one of the two custom swatch slots
+    /// (filling empty slots first, then alternating) and makes it active.
+    func storeCustomColor(hex: String) {
+        let defaults = UserDefaults.standard
+        if customColor1Hex == nil {
+            customColor1Hex = hex
+        } else if customColor2Hex == nil {
+            customColor2Hex = hex
+        } else if defaults.bool(forKey: DefaultsKey.customColorNextSlot) {
+            customColor2Hex = hex
+            defaults.set(false, forKey: DefaultsKey.customColorNextSlot)
+        } else {
+            customColor1Hex = hex
+            defaults.set(true, forKey: DefaultsKey.customColorNextSlot)
+        }
+        setActiveColor(hex: hex)
+    }
+
     var currentPKTool: PKTool {
-        // Resolve against light traits: the page is always white, and PencilKit
-        // inverts dynamic ink colors in dark mode (black becomes white and vice
-        // versa) unless the color and canvas are pinned to light appearance.
-        let resolvedInk = inkColor.resolvedColor(
-            with: UITraitCollection(userInterfaceStyle: .light)
-        )
+        // Hex colors are static, so PencilKit's dark-mode ink inversion never
+        // sees a dynamic color to flip (pages are pinned to light anyway).
         switch selectedTool {
         case .pen:
-            return PKInkingTool(.pen, color: resolvedInk, width: penWidth)
+            return PKInkingTool(.pen, color: UIColor(hexString: penColorHex), width: penWidth)
         case .pencil:
-            return PKInkingTool(.pencil, color: resolvedInk, width: pencilWidth)
+            return PKInkingTool(.pencil, color: UIColor(hexString: penColorHex), width: pencilWidth)
         case .highlighter:
             return PKInkingTool(
                 .marker,
-                color: resolvedInk.withAlphaComponent(0.35),
+                color: UIColor(hexString: highlighterColorHex).withAlphaComponent(0.35),
                 width: highlighterWidth
             )
         case .eraser:
@@ -188,8 +290,25 @@ final class DrawingCanvasController: ObservableObject {
         case .lasso:
             return PKLassoTool()
         case .hand, .text:
-            return PKInkingTool(.pen, color: resolvedInk, width: penWidth)
+            return PKInkingTool(.pen, color: UIColor(hexString: penColorHex), width: penWidth)
         }
+    }
+
+    // MARK: Text styling
+
+    /// Configures a freshly created text box with the current text defaults.
+    func configureNewTextElement(_ element: inout PageElement) {
+        element.fontSize = textFontSize
+        element.colorHex = textColorHex
+        element.alignment = textAlignment
+        element.isBold = textIsBold
+        element.isItalic = textIsItalic
+        element.fontDesign = textFontDesign
+    }
+
+    /// Updates the defaults and restyles the currently selected text box, if any.
+    func applyTextStyle(_ change: @escaping (inout PageElement) -> Void) {
+        host?.pageViews.forEach { $0.elementsView.updateSelectedTextElement(change) }
     }
 
     func applyToolConfiguration() {
@@ -210,10 +329,11 @@ final class DrawingCanvasController: ObservableObject {
                 (selectedTool == .hand || selectedTool == .text)
         }
 
-        // One finger draws (when allowed); two fingers always pan.
-        // The lasso claims single-finger drags for itself.
+        // One finger draws (when allowed); two fingers always pan. The lasso
+        // and a selected element also claim single-finger drags for themselves.
         host.panGestureRecognizer.minimumNumberOfTouches =
-            ((canvasActive && fingerDrawingEnabled) || selectedTool == .lasso) ? 2 : 1
+            ((canvasActive && fingerDrawingEnabled) || selectedTool == .lasso || elementSelectionActive)
+                ? 2 : 1
         host.singleTapRecognizer?.isEnabled = (selectedTool == .hand || selectedTool == .text)
         host.textSelectionRecognizer?.isEnabled = selectedTool == .hand
         host.lassoRecognizer?.isEnabled = selectedTool == .lasso
@@ -246,7 +366,11 @@ final class DrawingCanvasController: ObservableObject {
     // MARK: History & page commands
 
     private var activeUndoManager: UndoManager? {
-        host?.pageViews.first?.canvasView.undoManager
+        guard let host else { return nil }
+        let activePage = host.currentPageID.flatMap { currentPageID in
+            host.pageViews.first { $0.pageID == currentPageID }
+        }
+        return (activePage ?? host.pageViews.first)?.canvasView.undoManager
     }
 
     func undo() {
@@ -571,6 +695,8 @@ final class MultiPageScrollView: UIScrollView {
     let pageSpacing: CGFloat = 24
     private(set) var naturalContentSize: CGSize = .zero
     private var lastFitBoundsSize: CGSize = .zero
+    private var hasPerformedInitialFit = false
+    private var pendingPageScroll: (id: UUID, animated: Bool)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -625,6 +751,11 @@ final class MultiPageScrollView: UIScrollView {
             pageView.textSelectionView.onHandleDragEnded = { [weak coordinator] in
                 coordinator?.presentSelectionMenu()
             }
+            pageView.elementsView.onSelectionStateChanged = { [weak self, weak coordinator] _ in
+                guard let self, let coordinator else { return }
+                coordinator.parent.controller.elementSelectionActive =
+                    self.pageViews.contains { $0.elementsView.hasSelection }
+            }
             pagesContainer.addSubview(pageView)
             pageViews.append(pageView)
             offsetY += spec.size.height + pageSpacing
@@ -635,6 +766,8 @@ final class MultiPageScrollView: UIScrollView {
         pagesContainer.frame = CGRect(origin: .zero, size: naturalContentSize)
         contentSize = naturalContentSize
         lastFitBoundsSize = .zero
+        hasPerformedInitialFit = false
+        pendingPageScroll = nil
         setNeedsLayout()
     }
 
@@ -654,6 +787,10 @@ final class MultiPageScrollView: UIScrollView {
     }
 
     func scroll(toPageID pageID: UUID, animated: Bool) {
+        guard hasPerformedInitialFit else {
+            pendingPageScroll = (pageID, animated)
+            return
+        }
         guard let pageView = pageViews.first(where: { $0.pageID == pageID }) else { return }
         let frameInSelf = pagesContainer.convert(pageView.frame, to: self)
         let minOffset = -contentInset.top
@@ -666,17 +803,37 @@ final class MultiPageScrollView: UIScrollView {
         super.layoutSubviews()
         guard naturalContentSize.width > 0, bounds.width > 0, bounds.height > 0 else { return }
 
-        if lastFitBoundsSize != bounds.size {
+        let sizeChanged =
+            abs(lastFitBoundsSize.width - bounds.width) > 1
+            || abs(lastFitBoundsSize.height - bounds.height) > 1
+
+        if sizeChanged {
             lastFitBoundsSize = bounds.size
             let fitScale = (bounds.width - 48) / naturalContentSize.width
             let clamped = max(min(fitScale, maximumZoomScale), 0.05)
             minimumZoomScale = max(clamped * 0.5, 0.05)
-            setZoomScale(clamped, animated: false)
-            centerContent()
-            contentOffset = CGPoint(x: -contentInset.left, y: -contentInset.top)
-        } else {
-            centerContent()
+
+            if !hasPerformedInitialFit {
+                hasPerformedInitialFit = true
+                setZoomScale(clamped, animated: false)
+                centerContent()
+                contentOffset = CGPoint(x: -contentInset.left, y: -contentInset.top)
+                if let pendingPageScroll {
+                    self.pendingPageScroll = nil
+                    scroll(toPageID: pendingPageScroll.id, animated: pendingPageScroll.animated)
+                }
+                return
+            }
+
+            // Navigation and toolbar transitions can produce several temporary
+            // bounds values. Refitting and jumping back to page one for every
+            // intermediate size makes both the PDF and its toolbar appear to
+            // flash. Preserve the user's zoom/position after the first fit.
+            if zoomScale < minimumZoomScale {
+                setZoomScale(minimumZoomScale, animated: false)
+            }
         }
+        centerContent()
     }
 
     func centerContent() {
@@ -876,8 +1033,14 @@ struct NotebookCanvasView: UIViewRepresentable {
            target != coordinator.lastScrolledPageID {
             coordinator.lastScrolledPageID = target
             coordinator.isProgrammaticScroll = true
+            let shouldAnimate = coordinator.hasAppliedInitialSelection
+            coordinator.hasAppliedInitialSelection = true
             DispatchQueue.main.async { [weak scrollView, weak coordinator] in
-                scrollView?.scroll(toPageID: target, animated: true)
+                scrollView?.scroll(toPageID: target, animated: shouldAnimate)
+                if !shouldAnimate {
+                    coordinator?.isProgrammaticScroll = false
+                    coordinator?.lastReportedPageID = target
+                }
                 // If no animation actually starts (already in place), unlock.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
                     coordinator?.isProgrammaticScroll = false
@@ -895,7 +1058,7 @@ struct NotebookCanvasView: UIViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, PKCanvasViewDelegate, UIScrollViewDelegate,
                              UIGestureRecognizerDelegate, UIPencilInteractionDelegate,
-                             UIEditMenuInteractionDelegate {
+                             @preconcurrency UIEditMenuInteractionDelegate {
         var parent: NotebookCanvasView
         weak var host: MultiPageScrollView?
         weak var editMenuInteraction: UIEditMenuInteraction?
@@ -904,6 +1067,7 @@ struct NotebookCanvasView: UIViewRepresentable {
         var appliedAnnotations: [UUID: [WordAnnotation]]?
         var isLoadingPages = false
         var isProgrammaticScroll = false
+        var hasAppliedInitialSelection = false
         var lastReportedPageID: UUID?
         var lastScrolledPageID: UUID?
         private var isReplacingStroke = false
@@ -930,7 +1094,6 @@ struct NotebookCanvasView: UIViewRepresentable {
         private var lassoElementIDs: [UUID] = []
         private var lassoGroupBox: CGRect = .null
         private var lassoLastPoint: CGPoint = .zero
-        private var lassoPendingStrokeTranslation: CGPoint = .zero
         private var lassoPendingStrokeScale: CGFloat = 1
         private var lassoScaleStartBox: CGRect = .null
 
@@ -1007,12 +1170,14 @@ struct NotebookCanvasView: UIViewRepresentable {
                 editMenuInteraction?.dismissMenu()
             }
             guard !isProgrammaticScroll,
+                  hasAppliedInitialSelection,
                   let currentID = host.currentPageID,
                   currentID != lastReportedPageID else { return }
             lastReportedPageID = currentID
             // A manual scroll invalidates the last programmatic target, so
             // tapping that page in the rail again scrolls back to it.
             lastScrolledPageID = nil
+            parent.controller.refreshHistoryState()
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.parent.selectedPageID = currentID
@@ -1023,6 +1188,7 @@ struct NotebookCanvasView: UIViewRepresentable {
             guard let host = scrollView as? MultiPageScrollView else { return }
             isProgrammaticScroll = false
             lastReportedPageID = host.currentPageID
+            parent.controller.refreshHistoryState()
         }
 
         // MARK: Taps
@@ -1053,10 +1219,13 @@ struct NotebookCanvasView: UIViewRepresentable {
 
             switch parent.controller.selectedTool {
             case .text:
+                let controller = parent.controller
                 pageView.elementsView.addTextElement(
                     at: local,
-                    fontSize: parent.controller.textFontSize
-                )
+                    fontSize: controller.textFontSize
+                ) { element in
+                    controller.configureNewTextElement(&element)
+                }
             case .hand:
                 // Underlined saved words open their saved definition popup.
                 if let annotation = pageView.annotationView.annotation(at: local) {
@@ -1429,16 +1598,14 @@ struct NotebookCanvasView: UIViewRepresentable {
                     lassoMode = .scaling(anchor: anchor, startPoint: local)
                     lassoScaleStartBox = lassoGroupBox
                     lassoPendingStrokeScale = 1
-                    lassoPendingStrokeTranslation = .zero
                     editMenuInteraction?.dismissMenu()
                     return
                 }
 
-                // Inside the box → move the whole group.
-                if lassoGroupBox.insetBy(dx: -10, dy: -10).contains(local) {
+                // Inside the box (generously padded) → move the whole group.
+                if lassoGroupBox.insetBy(dx: -16, dy: -16).contains(local) {
                     lassoMode = .moving
                     lassoLastPoint = local
-                    lassoPendingStrokeTranslation = .zero
                     lassoPendingStrokeScale = 1
                     editMenuInteraction?.dismissMenu()
                     return
@@ -1468,8 +1635,6 @@ struct NotebookCanvasView: UIViewRepresentable {
             case .moving:
                 let delta = CGPoint(x: local.x - lassoLastPoint.x, y: local.y - lassoLastPoint.y)
                 lassoLastPoint = local
-                lassoPendingStrokeTranslation.x += delta.x
-                lassoPendingStrokeTranslation.y += delta.y
                 lassoGroupBox = lassoGroupBox.offsetBy(dx: delta.x, dy: delta.y)
                 pageView.elementsView.transformElements(
                     ids: lassoElementIDs,
@@ -1477,6 +1642,8 @@ struct NotebookCanvasView: UIViewRepresentable {
                     scale: 1,
                     anchor: .zero
                 )
+                // Strokes follow live too, not just at gesture end.
+                applyLiveStrokeTransform(translation: delta, scale: 1, anchor: .zero, on: pageView)
                 pageView.lassoOverlayView.showGroup(box: lassoGroupBox)
             case .scaling(let anchor, let startPoint):
                 let startDistance = max(hypot(startPoint.x - anchor.x, startPoint.y - anchor.y), 1)
@@ -1490,6 +1657,7 @@ struct NotebookCanvasView: UIViewRepresentable {
                     scale: stepScale,
                     anchor: anchor
                 )
+                applyLiveStrokeTransform(translation: .zero, scale: stepScale, anchor: anchor, on: pageView)
                 lassoGroupBox = scaled(lassoScaleStartBox, by: totalScale, about: anchor)
                 pageView.lassoOverlayView.showGroup(box: lassoGroupBox)
             case .idle:
@@ -1507,21 +1675,15 @@ struct NotebookCanvasView: UIViewRepresentable {
             case .drawing:
                 pageView.lassoOverlayView.clearPath()
                 finishLassoSelection(on: pageView)
-            case .moving:
-                applyPendingStrokeTransform(
-                    translation: lassoPendingStrokeTranslation,
-                    scale: 1,
-                    anchor: .zero,
-                    on: pageView
-                )
-                presentLassoMenu()
-            case .scaling(let anchor, _):
-                applyPendingStrokeTransform(
-                    translation: .zero,
-                    scale: lassoPendingStrokeScale,
-                    anchor: anchor,
-                    on: pageView
-                )
+            case .moving, .scaling:
+                // Strokes were transformed live; persist the result once.
+                if !lassoStrokeIndices.isEmpty {
+                    parent.onDrawingChanged(
+                        pageView.pageID,
+                        pageView.canvasView.drawing.dataRepresentation()
+                    )
+                    parent.controller.refreshHistoryState()
+                }
                 presentLassoMenu()
             case .idle:
                 break
@@ -1585,14 +1747,17 @@ struct NotebookCanvasView: UIViewRepresentable {
             presentLassoMenu()
         }
 
-        private func applyPendingStrokeTransform(
+        /// Applies an incremental translation/scale to the lassoed strokes
+        /// without persisting — called on every gesture step so ink follows
+        /// the finger; the result is saved once when the gesture ends.
+        private func applyLiveStrokeTransform(
             translation: CGPoint,
             scale: CGFloat,
             anchor: CGPoint,
             on pageView: PageCanvasView
         ) {
             guard !lassoStrokeIndices.isEmpty,
-                  translation != .zero || abs(scale - 1) > 0.001 else { return }
+                  translation != .zero || abs(scale - 1) > 0.0001 else { return }
             let transform = CGAffineTransform(
                 a: scale, b: 0, c: 0, d: scale,
                 tx: anchor.x * (1 - scale) + translation.x,
@@ -1606,8 +1771,6 @@ struct NotebookCanvasView: UIViewRepresentable {
             isReplacingStroke = true
             pageView.canvasView.drawing = drawing
             isReplacingStroke = false
-            parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
-            parent.controller.refreshHistoryState()
         }
 
         private func scaled(_ rect: CGRect, by scale: CGFloat, about anchor: CGPoint) -> CGRect {
@@ -1645,12 +1808,14 @@ struct NotebookCanvasView: UIViewRepresentable {
 
         private func duplicateLassoGroup() {
             guard let pageView = lassoPageView else { return }
+            var newStrokeIndices: [Int] = []
             if !lassoStrokeIndices.isEmpty {
                 var drawing = pageView.canvasView.drawing
                 let offset = CGAffineTransform(translationX: 24, y: 24)
                 for index in lassoStrokeIndices where drawing.strokes.indices.contains(index) {
                     var copy = drawing.strokes[index]
                     copy.transform = copy.transform.concatenating(offset)
+                    newStrokeIndices.append(drawing.strokes.count)
                     drawing.strokes.append(copy)
                 }
                 isReplacingStroke = true
@@ -1658,8 +1823,16 @@ struct NotebookCanvasView: UIViewRepresentable {
                 isReplacingStroke = false
                 parent.onDrawingChanged(pageView.pageID, drawing.dataRepresentation())
             }
-            pageView.elementsView.duplicateElements(ids: lassoElementIDs)
-            clearLassoSelection()
+            let newElementIDs = pageView.elementsView.duplicateElements(ids: lassoElementIDs)
+
+            // The copies become the active selection, ready to drag into place.
+            lassoStrokeIndices = newStrokeIndices
+            lassoElementIDs = newElementIDs
+            lassoGroupBox = lassoGroupBox.offsetBy(dx: 24, dy: 24)
+            pageView.lassoOverlayView.showGroup(box: lassoGroupBox)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.presentLassoMenu()
+            }
         }
 
         private func deleteLassoGroup() {
@@ -1878,13 +2051,20 @@ final class LassoOverlayView: UIView {
 /// re-rasterizing at each zoom level so text stays sharp — never a fixed PNG.
 private let pdfPageRenderLock = NSLock()
 
+/// CATiledLayer normally cross-fades every freshly rendered tile. During a
+/// document push or zoom that exposes the page background between tiles and
+/// reads as a white flicker.
+private final class NonFadingPDFTiledLayer: CATiledLayer {
+    override class func fadeDuration() -> CFTimeInterval { 0 }
+}
+
 final class PDFPageBackgroundView: UIView {
     var pdfPage: PDFPage? {
         didSet { setNeedsDisplay() }
     }
 
     override class var layerClass: AnyClass {
-        CATiledLayer.self
+        NonFadingPDFTiledLayer.self
     }
 
     override init(frame: CGRect) {

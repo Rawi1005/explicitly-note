@@ -163,11 +163,13 @@ private struct NotesLibraryContent: View {
     }
 
     private func delete(_ note: Note) {
-        if selectedNote == note {
-            selectedNote = nil
+        withAnimation(.snappy(duration: 0.22)) {
+            if selectedNote == note {
+                selectedNote = nil
+            }
+            path.removeAll { $0 == note }
+            viewModel.delete(note)
         }
-        path.removeAll { $0 == note }
-        viewModel.delete(note)
     }
 
     // MARK: - Empty state
