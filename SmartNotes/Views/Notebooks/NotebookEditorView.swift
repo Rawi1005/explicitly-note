@@ -303,10 +303,9 @@ struct NotebookEditorView: View {
                 pdfDocument: pdfDocument,
                 selectedPageID: $selectedPageID,
                 controller: drawingController,
-                // Keep this constant while contextual controls open and close.
-                // Changing the scroll inset during a PDF tile render is a
-                // common source of the document-entry flash.
-                topOverlayInset: 116,
+                // The palette floats above the page, Notability-style. Do not
+                // reserve document space for it.
+                topOverlayInset: 0,
                 searchHighlights: searchHighlights,
                 annotations: pageAnnotations,
                 onDrawingChanged: saveDrawing,
